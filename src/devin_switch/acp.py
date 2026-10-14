@@ -40,7 +40,10 @@ LOCAL_COMMANDS = [
 LOCAL_NAMES = {"/" + command["name"] for command in LOCAL_COMMANDS}
 AGENT_STOPPED = "_cognition.ai/agent_stopped"
 RESOURCE_EXHAUSTED = -32011
+RESOURCE_NOT_FOUND = -32002
 AUTO_SWITCH_LIMIT = 3
+CATALOG_ATTEMPTS = 3
+CATALOG_RETRY_DELAY = 1.0
 BLOCKED_COMMANDS = {"login", "logout", "org", "new", "resume"}
 LIVE_CONTROLS = {
     "session/set_config_option",
@@ -66,6 +69,10 @@ class RpcError(SwitchError):
         super().__init__(message)
         self.code = code
         self.data = data
+
+
+class CatalogUnavailable(SwitchError):
+    pass
 
 
 def quota_exhausted(error: RpcError) -> bool:
@@ -867,6 +874,28 @@ class Bridge:
         return result
 
     async def restore(self, chat, account, settings, mode, model, *, setup=None, replay=False):
+        for attempt in range(1, CATALOG_ATTEMPTS + 1):
+            try:
+                return await self.restore_once(
+                    chat,
+                    account,
+                    settings,
+                    mode,
+                    model,
+                    setup=setup,
+                    replay=replay and attempt == 1,
+                )
+            except CatalogUnavailable:
+                if attempt == CATALOG_ATTEMPTS:
+                    raise
+            await self.note(
+                chat.session_id,
+                f"{account.name} has not loaded its options yet (slow network?); "
+                "retrying with a fresh agent…",
+            )
+            await asyncio.sleep(CATALOG_RETRY_DELAY * attempt)
+
+    async def restore_once(self, chat, account, settings, mode, model, *, setup, replay):
         setup = chat.setup if setup is None else setup
         candidate = Backend(self, account, Path(setup["cwd"]), chat.session_id)
         candidate.suppress_replay = not replay
@@ -881,16 +910,28 @@ class Bridge:
                 if current is None:
                     raise SwitchError("The destination cannot preserve this chat's configuration.")
                 if current["currentValue"] != option["currentValue"]:
-                    await candidate.request(
-                        "session/set_config_option",
-                        {
-                            "sessionId": chat.session_id,
-                            "configId": identifier,
-                            "value": option["currentValue"],
-                            **({"type": "boolean"} if option.get("type") == "boolean" else {}),
-                        },
-                        LIFECYCLE_TIMEOUT,
-                    )
+                    try:
+                        await candidate.request(
+                            "session/set_config_option",
+                            {
+                                "sessionId": chat.session_id,
+                                "configId": identifier,
+                                "value": option["currentValue"],
+                                **({"type": "boolean"} if option.get("type") == "boolean" else {}),
+                            },
+                            LIFECYCLE_TIMEOUT,
+                        )
+                    except RpcError as exc:
+                        if (
+                            exc.code == RESOURCE_NOT_FOUND
+                            and current.get("type") == "select"
+                            and not current.get("options")
+                        ):
+                            raise CatalogUnavailable(
+                                f"{account.name} could not load its {identifier} list "
+                                "(slow or unavailable network). No prompt was replayed."
+                            ) from exc
+                        raise
             if (
                 mode
                 and mode != candidate.mode
@@ -932,7 +973,9 @@ class Bridge:
             candidate.suppress_replay = False
             return candidate, result
         except BaseException as exc:
-            await candidate.close()
+            closed = await candidate.close()
+            if isinstance(exc, CatalogUnavailable) and closed:
+                raise CatalogUnavailable(f"{stage}: {exc}") from exc
             if isinstance(exc, (SwitchError, OSError)):
                 raise SwitchError(f"{stage}: {failure_detail(exc)}") from exc
             raise

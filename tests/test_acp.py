@@ -1429,6 +1429,93 @@ def test_gui_quota_exhaustion_switches_and_continues_in_the_same_turn(
     asyncio.run(scenario())
 
 
+def cold_catalog(native, monkeypatch, starts):
+    counter = native.store.root.parent / "cold-starts"
+    counter.write_text(str(starts))
+    monkeypatch.setenv("FAKE_COLD_CATALOG_ACCOUNT", "ansuman-2")
+    monkeypatch.setenv("FAKE_COLD_CATALOG_STARTS", str(counter))
+    monkeypatch.setattr(acp, "CATALOG_RETRY_DELAY", 0)
+
+
+def test_gui_auto_switch_retries_destination_whose_model_list_did_not_load(
+    acp_native, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage())
+    monkeypatch.setenv("FAKE_QUOTA_ACCOUNTS", "ansuman-1")
+    cold_catalog(acp_native, monkeypatch, 1)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            result = await bridge.dispatch("session/prompt", prompt_params(session_id, "work"))
+            assert result == {"stopReason": "end_turn"}
+            chat = bridge.chats[session_id]
+            assert chat.backend.account.name == "ansuman-2"
+            assert chat.backend.configs["model"]["currentValue"] == "test-model"
+            assert acp_native.store.selected().name == "ansuman-2"
+            assert prompts(acp_native) == [("ansuman-1", "work"), ("ansuman-2", "continue")]
+            loads = [call for call in logged(acp_native) if call["method"] == "session/load"]
+            assert [call["account"] for call in loads] == ["ansuman-2", "ansuman-2"]
+            assert len({call["pid"] for call in loads}) == 2
+            text = json.dumps(messages)
+            assert "retrying with a fresh agent" in text
+            assert "Automatic switch stopped" not in text
+
+    asyncio.run(scenario())
+
+
+def test_gui_switch_gives_up_when_destination_model_list_never_loads(
+    acp_native, tmp_path, monkeypatch
+):
+    cold_catalog(acp_native, monkeypatch, -1)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "/switch ansuman-2"))
+            output = json.dumps(messages, ensure_ascii=False)
+            assert "Switch to ansuman-2 failed" in output
+            assert "could not load its model list" in output
+            assert "the previous account was restored" in output
+            assert output.count("retrying with a fresh agent") == acp.CATALOG_ATTEMPTS - 1
+            loads = [call for call in logged(acp_native) if call["method"] == "session/load"]
+            assert [call["account"] for call in loads] == ["ansuman-2"] * acp.CATALOG_ATTEMPTS + [
+                "ansuman-1"
+            ]
+            assert acp_native.store.selected().name == "ansuman-1"
+            assert bridge.chats[session_id].backend.account.name == "ansuman-1"
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "continue"))
+            assert prompts(acp_native) == [("ansuman-1", "continue")]
+
+    asyncio.run(scenario())
+
+
+def test_gui_switch_does_not_retry_a_model_the_destination_lacks(acp_native, tmp_path, monkeypatch):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            chat = bridge.chats[created["sessionId"]]
+            chat.backend.configs["model"]["currentValue"] = "unknown-model"
+            request = acp.Backend.request
+
+            async def missing_model(backend, method, params, timeout=None):
+                if method == "session/set_config_option" and params["value"] == "unknown-model":
+                    raise acp.RpcError("Native ACP rejected the request (RPC code -32002).", -32002)
+                return await request(backend, method, params, timeout)
+
+            monkeypatch.setattr(acp.Backend, "request", missing_model)
+            with pytest.raises(SwitchError, match="RPC code -32002"):
+                await bridge.switch(chat, "ansuman-2")
+            assert "retrying" not in json.dumps(messages)
+            assert [
+                call["account"] for call in logged(acp_native) if call["method"] == "session/load"
+            ] == ["ansuman-2", "ansuman-1"]
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("case", ["disabled", "rate-limited", "canceled"])
 def test_gui_quota_error_without_auto_switch_is_returned_unchanged(
     acp_native, tmp_path, monkeypatch, case

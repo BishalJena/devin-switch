@@ -22,6 +22,13 @@ connection.execute(
 )
 connection.commit()
 settings = {"mode": "ask", "model": "test-model"}
+cold = False
+if account == os.environ.get("FAKE_COLD_CATALOG_ACCOUNT"):
+    counter = Path(os.environ["FAKE_COLD_CATALOG_STARTS"])
+    remaining = int(counter.read_text())
+    cold = remaining != 0
+    if remaining > 0:
+        counter.write_text(str(remaining - 1))
 replies = {}
 loaded = None
 project = None
@@ -39,8 +46,11 @@ def configs():
             "name": key,
             "category": key,
             "type": "select",
-            "currentValue": value,
-            "options": [{"value": value, "name": value}],
+            **(
+                {"currentValue": "fallback-model", "options": []}
+                if cold and key == "model"
+                else {"currentValue": value, "options": [{"value": value, "name": value}]}
+            ),
         }
         for key, value in settings.items()
     ]
@@ -216,6 +226,18 @@ async def handle(message):
     elif method == "session/cancel":
         canceled.set()
     elif method == "session/set_config_option":
+        if cold and params["configId"] == "model":
+            emit(
+                {
+                    "id": message["id"],
+                    "error": {
+                        "code": -32002,
+                        "message": "Resource not found",
+                        "data": {"uri": f"Model not found: {params['value']}. Available models: "},
+                    },
+                }
+            )
+            return
         if os.environ.get("FAKE_IGNORE_CONFIG_ACCOUNT") != account:
             settings[params["configId"]] = params["value"]
         result = {"configOptions": configs()}
