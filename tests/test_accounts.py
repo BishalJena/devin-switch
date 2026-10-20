@@ -180,6 +180,21 @@ def test_nested_launch_keeps_original_github_config(native: Native, tmp_path: Pa
     assert native.environment(second)["GH_CONFIG_DIR"] == str(tmp_path / "user-config/gh")
 
 
+@pytest.mark.parametrize(
+    ("inherited", "kept"),
+    [
+        ("http://127.0.0.1:50123/" + "a" * 32 + "/v1/logs", False),
+        ("https://collector.example.invalid/v1/logs", True),
+    ],
+)
+def test_nested_launch_drops_only_parent_quota_receiver(
+    native: Native, monkeypatch, inherited: str, kept: bool
+):
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", inherited)
+    environment = native.environment(native.store.accounts()[0])
+    assert ("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT" in environment) is kept
+
+
 @pytest.mark.skipif(not shutil.which("gh"), reason="GitHub CLI is not installed")
 def test_real_github_cli_reuses_config_across_accounts(native: Native, tmp_path: Path, monkeypatch):
     home = tmp_path / "home"
