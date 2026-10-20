@@ -1,13 +1,16 @@
 """Use existing Chrome profiles without reading cookies or passwords."""
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from devin_switch.store import SwitchError
 
-CHROME_DATA = Path.home() / "Library/Application Support/Google/Chrome"
+CHROME_DATA = Path(
+    os.environ.get("DS_CHROME_DATA") or Path.home() / "Library/Application Support/Google/Chrome"
+)
 CHROME_APP = Path("/Applications/Google Chrome.app")
 MANUAL_LOGIN_URL = "https://app.devin.ai/auth/cli/token"
 

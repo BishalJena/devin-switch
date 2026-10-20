@@ -249,6 +249,37 @@ Use separate Git worktrees if concurrent sessions would otherwise edit the same 
 
 CLI removal requires explicit confirmation: `ds remove work --yes`.
 
+### Let agents use a browser without interrupting you
+
+`ds browser install` registers one `browser` MCP server for every chat (Switch's shared MCP
+config and your user-level `~/.config/devin/mcp_config.json`). It also allows its tools
+(`mcp__browser__*`) in every saved login, in the user config, and in logins you add later. Old
+`chrome-devtools-mcp` entries are replaced. Restart open chats afterwards.
+
+```sh
+ds browser install --default you@example.com   # or a profile name or "Profile 3"
+```
+
+The agent never attaches to the Chrome you are using:
+
+- **One separate instance per Chrome profile.** The first time a chat names a profile, Switch
+  copies that profile's cookies and site storage into its own folder. Passwords, extensions,
+  history and service-worker caches are not copied, and Switch never decrypts the copies.
+  Your Chrome is only read. `ds browser refresh PROFILE` copies the logins again.
+- **Headless by default.** No window, no Dock icon and no focus change. Snapshots and
+  screenshots still render the full UI at 1440×900. The agent can ask for a visible window,
+  opened in the background, when you want to watch.
+- **No "Allow remote debugging" prompts.** Chrome is started with its own debugging port.
+- **Profiles on the fly.** Agents call `browser_profile` with an email, a profile name or a
+  directory. Without one, a chat uses the default profile. Each chat stays bound to its
+  profile, and different chats can use different profiles at the same time.
+- **Closed when finished.** Chats release the browser with `browser_close`, after 15 idle
+  minutes, or when they exit. A supervisor closes the instance about 10 seconds after the last
+  chat releases it, and the next browser tool call reopens it with fresh pages.
+
+`ds browser status` lists profiles and running instances, and `ds browser stop` closes them
+immediately. The server runs `npx -y chrome-devtools-mcp@1.10.1`, so Node.js is required.
+
 ### Switch accounts inside Devin Desktop (experimental)
 
 The **Devin Switch ACP agent** runs the installed Devin CLI inside Desktop's chat UI,
@@ -408,6 +439,11 @@ extension.
 | `ds sessions` | List shared history for the current project |
 | `ds verify FIRST SECOND` | Check A → B → A login and local-history visibility |
 | `ds remove ALIAS --yes` | Remove a local profile, preserving shared history |
+| `ds browser install [--default PROFILE]` | Register the agent browser MCP server for all chats and allow its tools |
+| `ds browser default PROFILE` | Choose the Chrome profile for chats that name none |
+| `ds browser status` | List Chrome profiles, cloned agent profiles and running instances |
+| `ds browser refresh PROFILE` | Copy a Chrome profile's logins into its agent profile again |
+| `ds browser stop [PROFILE]` | Close running agent browsers now |
 
 `ds verify` makes no model request. Matching history across accounts is separate from a
 successful inference request; different credential files alone do not prove distinct users
@@ -428,9 +464,14 @@ handoffs/
 acp/sessions/
 acp/requests/
 acp/lifecycle/
+browser/profiles/<profile>/user-data/
 launchers/
 selected
 ```
+
+- Agent browser profiles hold copies of Chrome cookies and site storage. They are as
+  sensitive as your browser profile: the folders are private to your user, and the
+  `browser` MCP server gives agents full control of these logged-in sessions.
 
 - Native credentials are local files restricted to the current user, **not Keychain-encrypted**.
   Protect this directory and its backups as sensitive data.
@@ -457,6 +498,8 @@ selected
 | `DS_HOME` | Override Switch's private state directory; keep it outside the repository |
 | `DS_BINARY` | Choose the native Devin executable explicitly |
 | `DS_TEST_NATIVE` | Enable isolated, offline native-CLI compatibility tests |
+| `DS_CHROME_DATA`, `DS_BROWSER_CHROME`, `DS_BROWSER_MCP` | Tests only: fake Chrome data, Chrome executable and MCP child |
+| `DS_BROWSER_IDLE`, `DS_BROWSER_GRACE` | Seconds before an idle chat releases the browser (900), and before an unused one closes (10) |
 
 Never commit your state directory, environment files, signing certificates, or credentials.
 Ignore rules and secret scans provide safeguards, not a guarantee against every possible leak.
