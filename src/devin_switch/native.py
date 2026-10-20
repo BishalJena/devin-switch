@@ -30,6 +30,8 @@ AUTH_ENVIRONMENT = frozenset(
     }
 )
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+TELEMETRY_VARIABLE = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"
+RECEIVER_ENDPOINT = re.compile(r"http://127\.0\.0\.1:\d+/[0-9a-f]{32}/v1/logs")
 
 
 def find_binary() -> Path:
@@ -92,6 +94,8 @@ class Native:
         self.store.prepare(account)
         base = self.store.directory(account.name)
         excluded = AUTH_ENVIRONMENT | {"DS_RUN_ID", "DS_ACP_RUN_ID", "DS_EXECUTABLE", "DS_FROZEN"}
+        if RECEIVER_ENDPOINT.fullmatch(os.environ.get(TELEMETRY_VARIABLE, "")):
+            excluded |= {TELEMETRY_VARIABLE}
         environment = {
             **{key: value for key, value in os.environ.items() if key not in excluded},
             "XDG_DATA_HOME": str(base / "data"),

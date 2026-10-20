@@ -55,5 +55,5 @@ def isolated_cli_state(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
     # No inherited authentication should reach any fixture subprocess.
     for name in tuple(os.environ):
-        if name.startswith(("WINDSURF_", "CODEIUM_")):
+        if name.startswith(("WINDSURF_", "CODEIUM_", "OTEL_")):
             monkeypatch.delenv(name)
