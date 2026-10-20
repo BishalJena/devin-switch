@@ -1,5 +1,7 @@
 import argparse
+import asyncio
 import importlib.util
+import time
 from pathlib import Path
 
 import pytest
@@ -45,6 +47,41 @@ def test_login_url_survives_wrapping_and_styling() -> None:
         "&code_challenge=xyz&cli_pkce_marker=1"
     )
     assert enroll.login_url(b"Opening Plus 1. Code:") is None
+
+
+def test_other_sign_in_link_is_recognized_but_not_used() -> None:
+    other = (
+        b"Visit \x1b]8;;https://windsurf.com/account/login?redirect_uri=x&state=abc"
+        b"&response_type=code&code_challenge=xyz&cli_pkce_marker=1\x1b\\link\x1b]8;;\x1b\\"
+        b" to sign in\r\nCode:"
+    )
+    assert enroll.login_url(other) is None
+    assert enroll.other_login_url(other)
+    devin = b"Visit https://app.devin.ai/auth/cli/continue?state=abc&cli_pkce_marker=1 Code:"
+    assert enroll.login_url(devin)
+    assert not enroll.other_login_url(devin)
+    assert not enroll.other_login_url(b"Opening Plus 1. Code:")
+
+
+def test_submit_keeps_reading_until_login_exits(tmp_path: Path) -> None:
+    fake = tmp_path / "ds"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys, time\n"
+        "sys.stdin.readline()\n"
+        "for _ in range(400):\n"
+        "    print('verifying ' * 40, flush=True)\n"
+        "time.sleep(1)\n"
+        "print('Login saved for fake.', flush=True)\n"
+    )
+    fake.chmod(0o755)
+    login = enroll.Login(str(fake), "fake")
+    start = time.monotonic()
+    try:
+        assert asyncio.run(login.submit("code")) == "Login saved for fake."
+        assert time.monotonic() - start < 15
+    finally:
+        login.close()
 
 
 def test_redact_hides_code_like_values() -> None:
