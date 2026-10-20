@@ -14,7 +14,7 @@ from devin_switch import agent_browser, browser, cli, handoff
 from devin_switch.store import Store, SwitchError
 
 FAKE_CHROME = """\
-import http.server, json, pathlib, signal, sys, threading
+import http.server, json, pathlib, signal, socketserver, sys, threading
 data = pathlib.Path(next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--user-data-dir=")))
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -23,11 +23,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({"Browser": "Fake"}).encode())
     def log_message(self, *args):
         pass
-server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+# HTTPServer.server_bind does a reverse DNS lookup that can stall on CI runners.
+server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 with (data / "launches").open("a") as log:
     log.write(" ".join(sys.argv[1:]) + "\\n")
-(data / "DevToolsActivePort").write_text(f"{server.server_port}\\n/devtools/browser/fake\\n")
+(data / "DevToolsActivePort").write_text(f"{server.server_address[1]}\\n/devtools/browser/fake\\n")
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 while True:
     signal.pause()
