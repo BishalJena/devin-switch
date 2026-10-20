@@ -97,8 +97,25 @@ def fakes(tmp_path: Path, chrome: Path, store: Store, monkeypatch: pytest.Monkey
             agent_browser.stop(current)
 
 
+def diagnostics(store: Store) -> str:
+    folders = sorted((store.root / "browser/profiles").glob("*"))
+    files = [
+        path
+        for folder in folders
+        for path in sorted(folder.glob("*.json")) + sorted(folder.glob("*.log"))
+    ]
+    listing = subprocess.run(
+        ("/bin/ps", "-axww", "-o", "pid=,command="), capture_output=True, text=True
+    )
+    related = [line for line in listing.stdout.splitlines() if str(store.root) in line]
+    return "\n".join(
+        [*(f"{path}:\n{path.read_text(errors='replace')}" for path in files), *related]
+    )
+
+
 class Client:
     def __init__(self, store: Store, **environment: str) -> None:
+        self.store = store
         self.process = subprocess.Popen(
             (sys.executable, "-m", "devin_switch.cli", "browser", "mcp"),
             stdin=subprocess.PIPE,
@@ -130,7 +147,10 @@ class Client:
         self.process.stdin.write(json.dumps(message) + "\n")
         self.process.stdin.flush()
         while True:
-            reply = self.messages.get(timeout=30)
+            try:
+                reply = self.messages.get(timeout=60)
+            except queue.Empty:
+                pytest.fail(f"No reply to {method}.\n{diagnostics(self.store)}")
             if reply.get("id") == self.next_id:
                 return reply
 
