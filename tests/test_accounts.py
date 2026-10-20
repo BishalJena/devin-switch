@@ -201,6 +201,136 @@ def test_real_github_cli_reuses_config_across_accounts(native: Native, tmp_path:
         assert not (native.store.directory(account.name) / "config/gh").exists()
 
 
+def unshare_mcp(store: Store, account) -> tuple[Path, Path]:
+    tokens = store.directory(account.name) / "data/devin/mcp"
+    config = store.directory(account.name) / "config/devin/mcp_config.json"
+    tokens.unlink()
+    config.unlink()
+    (tokens / "oauth").mkdir(parents=True)
+    return tokens, config
+
+
+def write_dated(path: Path, content: str, mtime: int) -> None:
+    path.write_text(content)
+    os.utime(path, (mtime, mtime))
+
+
+def test_mcp_servers_and_tokens_are_shared_but_logins_are_not(native: Native) -> None:
+    store = native.store
+    first, second = store.accounts()
+    first_env, second_env = native.environment(first), native.environment(second)
+    first_token = Path(first_env["XDG_DATA_HOME"]) / "devin/mcp/oauth/server.json"
+    first_token.parent.mkdir(parents=True)
+    first_token.write_text("token-from-first-login")
+    second_token = Path(second_env["XDG_DATA_HOME"]) / "devin/mcp/oauth/server.json"
+    assert second_token.read_text() == "token-from-first-login"
+    first_config = Path(first_env["XDG_CONFIG_HOME"]) / "devin/mcp_config.json"
+    second_config = Path(second_env["XDG_CONFIG_HOME"]) / "devin/mcp_config.json"
+    assert json.loads(second_config.read_text()) == {"mcpServers": {}}
+    first_config.write_text('{"mcpServers": {"github": {"url": "https://example.invalid"}}}')
+    assert "github" in json.loads(second_config.read_text())["mcpServers"]
+    assert store.credentials(first) != store.credentials(second)
+    assert first_env["XDG_CONFIG_HOME"] != second_env["XDG_CONFIG_HOME"]
+    assert stat.S_IMODE((store.root / "shared/mcp").stat().st_mode) == 0o700
+    assert stat.S_IMODE(second_config.resolve().stat().st_mode) == 0o600
+    store.remove(first)
+    assert second_token.read_text() == "token-from-first-login"
+    assert "github" in json.loads(second_config.read_text())["mcpServers"]
+
+
+def test_existing_mcp_tokens_migrate_with_newest_copy_and_no_deletion(store: Store) -> None:
+    first, second = store.accounts()
+    first_tokens, _ = unshare_mcp(store, first)
+    second_tokens, _ = unshare_mcp(store, second)
+    write_dated(first_tokens / "oauth/logfire.json", "first-older", 100)
+    write_dated(first_tokens / "oauth/sentry.json", "first-only", 100)
+    write_dated(second_tokens / "oauth/logfire.json", "second-newer", 200)
+    store.prepare(second)
+    shared = store.root / "shared/mcp/oauth"
+    assert (shared / "logfire.json").read_text() == "second-newer"
+    assert (shared / "sentry.json").read_text() == "first-only"
+    for account in (first, second):
+        tokens = store.directory(account.name) / "data/devin/mcp"
+        assert tokens.is_symlink() and tokens.resolve() == shared.parent.resolve()
+    assert not list(first_tokens.parent.glob("mcp.superseded-*"))
+    (retired,) = second_tokens.parent.glob("mcp.superseded-*")
+    assert [path.name for path in retired.rglob("*") if path.is_file()] == ["logfire.json"]
+    assert (retired / "oauth/logfire.json").read_text() == "first-older"
+    store.prepare(first)
+    assert len(list(second_tokens.parent.glob("mcp.superseded-*"))) == 1
+
+
+def test_existing_mcp_configs_merge_and_keep_comments(store: Store) -> None:
+    first, second = store.accounts()
+    _, first_config = unshare_mcp(store, first)
+    _, second_config = unshare_mcp(store, second)
+    original = (
+        '{\n  // keep this note\n  "mcpServers": {\n'
+        '    "chrome": {"command": "old"},\n    "linear": {"url": "https://l.invalid"},\n  },\n}\n'
+    )
+    write_dated(first_config, original, 100)
+    write_dated(
+        second_config,
+        '{"mcpServers": {"chrome": {"command": "new"}, "github": {"url": "https://g.invalid"}}}',
+        200,
+    )
+    store.prepare(second)
+    shared = store.root / "shared/config/mcp_config.json"
+    assert json.loads(shared.read_text())["mcpServers"] == {
+        "chrome": {"command": "new"},
+        "linear": {"url": "https://l.invalid"},
+        "github": {"url": "https://g.invalid"},
+    }
+    (retired,) = second_config.parent.glob("mcp_config.json.superseded-*")
+    assert "github" in retired.read_text()
+    assert not list(first_config.parent.glob("mcp_config.json.superseded-*"))
+    for config in (first_config, second_config):
+        assert config.is_symlink() and config.resolve() == shared.resolve()
+
+
+def test_single_existing_mcp_config_moves_with_comments(store: Store) -> None:
+    first = store.accounts()[0]
+    _, config = unshare_mcp(store, first)
+    original = '{\n  // keep this note\n  "mcpServers": {"chrome": {"command": "x"},},\n}\n'
+    config.write_text(original)
+    store.prepare(store.accounts()[1])
+    assert (store.root / "shared/config/mcp_config.json").read_text() == original
+    assert config.is_symlink()
+
+
+def test_replaced_mcp_config_link_is_merged_back(store: Store) -> None:
+    first, second = store.accounts()
+    config = store.directory(first.name) / "config/devin/mcp_config.json"
+    config.unlink()
+    config.write_text('{"mcpServers": {"written-directly": {"command": "x"}}}')
+    store.prepare(first)
+    assert config.is_symlink()
+    other = store.directory(second.name) / "config/devin/mcp_config.json"
+    assert "written-directly" in json.loads(other.read_text())["mcpServers"]
+
+
+def test_unreadable_mcp_config_is_preserved_and_reported(store: Store) -> None:
+    first = store.accounts()[0]
+    store.root.joinpath("shared/config/mcp_config.json").write_text('{"mcpServers": {}}')
+    _, config = unshare_mcp(store, first)
+    config.write_text("{not json")
+    with pytest.raises(SwitchError, match="Cannot share MCP servers"):
+        store.prepare(first)
+    store.prepare(store.accounts()[1])
+    assert config.read_text() == "{not json"
+    assert not config.is_symlink()
+
+
+def test_foreign_mcp_link_is_rejected(store: Store, tmp_path: Path) -> None:
+    first = store.accounts()[0]
+    tokens = store.directory(first.name) / "data/devin/mcp"
+    tokens.unlink()
+    (tmp_path / "elsewhere").mkdir()
+    tokens.symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+    with pytest.raises(SwitchError, match="Unexpected shared MCP link"):
+        store.prepare(first)
+
+
 def test_zero_exit_status_is_not_proof_of_authentication(native: Native) -> None:
     first = native.store.account("ansuman-1")
     native.store.credentials(first).write_text("expired-or-invalid")

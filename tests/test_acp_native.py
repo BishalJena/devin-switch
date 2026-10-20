@@ -127,6 +127,22 @@ def test_installed_acp_shared_history_without_login(
     asyncio.run(scenario())
 
 
+def test_installed_cli_shares_user_mcp_servers_across_logins(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    native = Native(store, Path(os.environ["DS_TEST_NATIVE"]))
+    first, second = store.accounts()
+    native.capture(first, ("mcp", "add", "-s", "user", "switch-shared", "--", "true"))
+    assert "switch-shared" in native.capture(second, ("mcp", "list"))
+    native.capture(second, ("mcp", "remove", "-s", "user", "switch-shared"))
+    assert "switch-shared" not in native.capture(first, ("mcp", "list"))
+    for account in (first, second):
+        config = store.directory(account.name) / "config/devin/mcp_config.json"
+        assert config.is_symlink()
+        assert config.resolve() == (store.root / "shared/config/mcp_config.json").resolve()
+        assert not store.credentials(account).exists()
+
+
 def test_installed_acp_new_chat_is_not_saved_before_a_prompt(store, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     native = Native(store, Path(os.environ["DS_TEST_NATIVE"]))

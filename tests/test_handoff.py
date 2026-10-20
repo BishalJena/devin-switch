@@ -115,6 +115,7 @@ def test_automatic_hook_refuses_symlinks(store, tmp_path, linked_directory):
     directory = store.directory(account.name) / "config/devin"
     (directory / "config.json").unlink()
     if linked_directory:
+        (directory / "mcp_config.json").unlink()
         directory.rmdir()
         directory.symlink_to(external, target_is_directory=True)
     else:
