@@ -9,7 +9,14 @@ from pathlib import Path
 
 from devin_switch import sessions, usage
 from devin_switch.native import Native
-from devin_switch.store import Account, Store, SwitchError, private_directory, write_json
+from devin_switch.store import (
+    Account,
+    Store,
+    SwitchError,
+    json_source,
+    private_directory,
+    write_json,
+)
 
 HOOK_COMMAND = (
     'if [ -n "${DS_RUN_ID:-}" ] && [ -n "${DS_EXECUTABLE:-}" ]; then '
@@ -53,19 +60,6 @@ def auto_switch_status(store: Store) -> str:
             f"login reporting the most remaining usage and sends “{CONTINUE_PROMPT}”."
         )
     return "Automatic switching is off. Out-of-usage chats stop until you switch manually."
-
-
-def json_source(text: str) -> str:
-    text = re.sub(
-        r'"(?:\\.|[^"\\])*"|//[^\r\n]*|/\*[\s\S]*?\*/',
-        lambda match: match[0] if match[0].startswith('"') else re.sub(r"[^\r\n]", " ", match[0]),
-        text,
-    )
-    return re.sub(
-        r'"(?:\\.|[^"\\])*"|,(?=\s*[}\]])',
-        lambda match: match[0] if match[0].startswith('"') else " ",
-        text,
-    )
 
 
 def member_start(source: str, start: int, name: str) -> int | None:

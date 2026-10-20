@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 NEW_ACCOUNT_CONFIG = {"attribution": False}
+EMPTY_MCP_CONFIG: dict = {"mcpServers": {}}
 
 
 class SwitchError(Exception):
@@ -49,6 +50,96 @@ def write_json(path: Path, value: object) -> None:
             temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def json_source(text: str) -> str:
+    text = re.sub(
+        r'"(?:\\.|[^"\\])*"|//[^\r\n]*|/\*[\s\S]*?\*/',
+        lambda match: match[0] if match[0].startswith('"') else re.sub(r"[^\r\n]", " ", match[0]),
+        text,
+    )
+    return re.sub(
+        r'"(?:\\.|[^"\\])*"|,(?=\s*[}\]])',
+        lambda match: match[0] if match[0].startswith('"') else " ",
+        text,
+    )
+
+
+def retire(path: Path) -> None:
+    path.rename(path.with_name(f"{path.name}.superseded-{time.time_ns()}"))
+
+
+def adopt_mcp_tokens(source: Path, destination: Path) -> None:
+    for folder, _, names in os.walk(source):
+        for name in names:
+            item = Path(folder) / name
+            target = destination / item.relative_to(source)
+            if item.is_symlink() or target.is_symlink():
+                continue
+            private_directory(target.parent)
+            if not target.exists():
+                os.replace(item, target)
+            elif item.stat().st_mtime > target.stat().st_mtime:
+                # Swap without a gap, so running agents never see a missing token.
+                previous = item.with_name(f".{item.name}.previous")
+                shutil.copy2(target, previous)
+                os.replace(item, target)
+                previous.rename(item)
+    if any(names for _, _, names in os.walk(source)):
+        retire(source)
+    else:
+        shutil.rmtree(source)
+
+
+def adopt_mcp_config(source: Path, destination: Path) -> None:
+    try:
+        incoming = json.loads(json_source(source.read_text()))
+        current = (
+            json.loads(json_source(destination.read_text()))
+            if destination.exists()
+            else EMPTY_MCP_CONFIG
+        )
+        if current == EMPTY_MCP_CONFIG:
+            os.replace(source, destination)
+            return
+        added, existing = incoming.get("mcpServers", {}), current.get("mcpServers", {})
+        if not all(isinstance(value, dict) for value in (added, existing)):
+            raise ValueError("Invalid server map")
+    except (ValueError, AttributeError) as exc:
+        raise SwitchError(
+            f"Cannot share MCP servers from {source}; fix or move that file and retry."
+        ) from exc
+    if source.stat().st_mtime > destination.stat().st_mtime:
+        servers = {**existing, **added}
+    else:
+        servers = {**added, **existing}
+    merged = {**incoming, **current, "mcpServers": servers}
+    if merged != current:
+        write_json(destination, merged)
+    retire(source)
+
+
+def share_link(name: str, link: Path, target: Path, adopt) -> None:
+    private_directory(link.parent)
+    private_directory(target.parent)
+    for _ in range(3):
+        if link.is_symlink():
+            if link.resolve() != target.resolve():
+                raise SwitchError(f"Unexpected shared MCP link for {name!r}.")
+        elif link.exists():
+            adopt(link, target)
+        if adopt is adopt_mcp_tokens:
+            private_directory(target)
+        elif not target.exists():
+            write_json(target, EMPTY_MCP_CONFIG)
+        if link.is_symlink():
+            return
+        try:
+            link.symlink_to(target.resolve(), target_is_directory=target.is_dir())
+            return
+        except FileExistsError:
+            continue
+    raise SwitchError("MCP settings changed during launch; retry.")
 
 
 @dataclass(frozen=True)
@@ -186,7 +277,7 @@ class Store:
 
     def prepare(self, account: Account) -> None:
         base = self.directory(account.name)
-        for area in ("data/devin", "config", "cache", "state"):
+        for area in ("data/devin", "config/devin", "cache", "state"):
             private_directory(base / area)
         # The native CLI keeps credentials above cli/. Share its session state only.
         for area in ("cli", "summaries"):
@@ -202,6 +293,33 @@ class Store:
                 )
             else:
                 link.symlink_to(shared.resolve(), target_is_directory=True)
+        self.share_mcp(account)
+
+    def share_mcp(self, account: Account) -> None:
+        # MCP servers and their OAuth tokens belong to the user, not to one Devin login.
+        # Adopt every profile at once so a token saved under another login is never stranded.
+        links = tuple(
+            (base.name, link, self.root / "shared" / target, adopt)
+            for base in sorted((self.root / "accounts").iterdir())
+            if base.is_dir() and not base.is_symlink() and (base / "account.json").is_file()
+            for link, target, adopt in (
+                (base / "data/devin/mcp", "mcp", adopt_mcp_tokens),
+                (base / "config/devin/mcp_config.json", "config/mcp_config.json", adopt_mcp_config),
+            )
+        )
+        if all(
+            link.is_symlink() and target.exists() and link.resolve() == target.resolve()
+            for _, link, target, _ in links
+        ):
+            return
+        with self.lock("mcp.lock", timeout=5):
+            for name, link, target, adopt in links:
+                try:
+                    share_link(name, link, target, adopt)
+                except SwitchError:
+                    # Another profile's unreadable file must not block this launch.
+                    if name == account.name:
+                        raise
 
     def credentials(self, account: Account) -> Path:
         return self.directory(account.name) / "data" / "devin" / "credentials.toml"
