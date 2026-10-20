@@ -82,41 +82,42 @@ def member_start(source: str, start: int, name: str) -> int | None:
             index += 1
 
 
-def enable(store: Store, account: Account) -> None:
-    path = store.directory(account.name) / "config/devin/config.json"
+def append_member(original: str, path: tuple[str, ...], item: object) -> str | None:
+    """Add item to the list at path, keeping JSONC comments; None when it is already present."""
+    source = json_source(original)
+    value = json.loads(source)
+    start = source.index("{")
+
+    def splice(index: int, addition: str, nonempty: bool, removed: int = 0) -> str:
+        return original[:index] + addition + ("," if nonempty else "") + original[index + removed :]
+
+    for depth, key in enumerate(path):
+        if not isinstance(value, dict):
+            raise ValueError("Invalid config object")
+        wrapped: object = [item]
+        for name in reversed(path[depth + 1 :]):
+            wrapped = {name: wrapped}
+        member = member_start(source, start, key)
+        if member is None:
+            return splice(start + 1, json.dumps(key) + ":" + json.dumps(wrapped), bool(value))
+        value, start = value[key], member
+        if value is None:
+            return splice(start, json.dumps(wrapped), False, 4)
+    if not isinstance(value, list):
+        raise ValueError("Invalid config list")
+    return None if item in value else splice(start + 1, json.dumps(item), bool(value))
+
+
+def extend_config(path: Path, member: tuple[str, ...], item: object) -> None:
     if path.is_symlink() or path.parent.is_symlink() or path.parent.parent.is_symlink():
         raise SwitchError(
             "Refusing to change linked profile config; existing settings are unchanged."
         )
     original = path.read_text() if path.exists() else "{}"
     try:
-        source = json_source(original)
-        config = json.loads(source)
-        hooks = config.get("hooks")
-        events = hooks.get("SessionEnd", []) if hooks is not None else []
-        if not isinstance(events, list):
-            raise ValueError("Invalid event list")
-        if HOOK in events:
+        updated = append_member(original, member, item)
+        if updated is None:
             return
-        root = source.index("{")
-        hook_start = member_start(source, root, "hooks")
-        event_start = member_start(source, hook_start, "SessionEnd") if hooks is not None else None
-        removed = 0
-        if hook_start is None:
-            index, addition = root + 1, '"hooks":' + json.dumps({"SessionEnd": [HOOK]})
-            nonempty = bool(config)
-        elif hooks is None:
-            index, addition = hook_start, json.dumps({"SessionEnd": [HOOK]})
-            nonempty, removed = False, 4
-        elif event_start is None:
-            index, addition = hook_start + 1, '"SessionEnd":' + json.dumps([HOOK])
-            nonempty = bool(hooks)
-        else:
-            index, addition = event_start + 1, json.dumps(HOOK)
-            nonempty = bool(events)
-        updated = (
-            original[:index] + addition + ("," if nonempty else "") + original[index + removed :]
-        )
         json.loads(json_source(updated))
     except (ValueError, AttributeError, TypeError, IndexError) as exc:
         raise SwitchError(
@@ -134,6 +135,12 @@ def enable(store: Store, account: Account) -> None:
             temporary.replace(path)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def enable(store: Store, account: Account) -> None:
+    extend_config(
+        store.directory(account.name) / "config/devin/config.json", ("hooks", "SessionEnd"), HOOK
+    )
 
 
 def choose_best(

@@ -50,9 +50,8 @@ def find_binary() -> Path:
     raise SwitchError("Devin CLI was not found. Install it or set DS_BINARY to its executable.")
 
 
-def github_config_directory(store: Store) -> str:
-    if configured := os.environ.get("GH_CONFIG_DIR"):
-        return configured
+def user_config_home(store: Store) -> Path:
+    """The incoming user-level XDG config directory, ignoring a Switch account's isolated one."""
     if configured := os.environ.get("XDG_CONFIG_HOME"):
         config = Path(configured).resolve()
         roots = {store.root.resolve()}
@@ -62,8 +61,12 @@ def github_config_directory(store: Store) -> str:
             config.parent.parent == root / "accounts" for root in roots
         )
         if not isolated:
-            return str(config / "gh")
-    return str(Path.home() / ".config/gh")
+            return config
+    return Path.home() / ".config"
+
+
+def github_config_directory(store: Store) -> str:
+    return os.environ.get("GH_CONFIG_DIR") or str(user_config_home(store) / "gh")
 
 
 @dataclass(frozen=True)
