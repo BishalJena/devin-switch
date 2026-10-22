@@ -32,6 +32,8 @@ class Upstream:
         self.keys = {api_key(name): name for name in accounts}
         self.exhausted = set()
         self.first_frame = None
+        # Empty protobuf bodies decode as default messages in the installed CLI.
+        self.empty_status = False
         self.requests = []
         self.lock = threading.Lock()
         upstream = self
@@ -55,7 +57,8 @@ class Upstream:
                         }
                     )
                 if self.path != INFERENCE:
-                    return self.send(200, "application/proto", f"status {header}".encode())
+                    status = b"" if upstream.empty_status else f"status {header}".encode()
+                    return self.send(200, "application/proto", status)
                 if header in upstream.exhausted:
                     payload = frame(2, json.dumps(QUOTA).encode())
                 else:
