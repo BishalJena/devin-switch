@@ -307,15 +307,16 @@ immediately. The server runs `npx -y chrome-devtools-mcp@1.10.1`, so Node.js is 
   and you can click, type, paste, scroll, navigate, open tabs or pick another Chrome profile.
   While the panel is open it holds the browser like a chat does, so Chrome stays open after
   the agent is done; closing the panel releases it.
-- **Canvas** shows a live whiteboard from
-  [whiteboard-mcp](https://github.com/ansuman-shukla/whiteboard-mcp). When an agent in a
-  Desktop chat opens a canvas, it appears beside that chat in the window showing the chat's
-  folder. Terminal chats, or Desktop without the panels,
-  keep opening the browser. `Switch: Open Whiteboard` opens the workspace board itself
-  (setting `switchPanels.whiteboardCommand`, default `whiteboard-mcp`).
+- **Whiteboard** shows boards from
+  [whiteboard-mcp](https://github.com/ansuman-shukla/whiteboard-mcp). Each chat gets its own
+  board, and when the agent explains something visually it opens beside the chat in the window
+  showing that chat's folder, for every Desktop chat. The extension connects to the whiteboard
+  daemon directly, so no browser tab and no restart of open chats is needed.
+  `Switch: Open Whiteboard` lists this workspace's boards (newest first) so you can reopen one
+  yourself. Setting `switchPanels.whiteboardHome` points at a non-default `WHITEBOARD_HOME`.
 
-Switch gives every chat `WHITEBOARD_OPEN="ds canvas show {url}"` unless you set that
-variable yourself. `ds panels status` shows the installed version.
+Switch gives chats `WHITEBOARD_CHAT_COMMAND="ds chat id"` (unless you set it), so a chat keeps
+its board across account handoffs. `ds panels status` shows the installed version.
 
 ### Switch accounts inside Devin Desktop (experimental)
 
@@ -482,7 +483,7 @@ extension.
 | `ds browser refresh PROFILE` | Copy a Chrome profile's logins into its agent profile again |
 | `ds browser stop [PROFILE]` | Close running agent browsers now |
 | `ds panels install` / `ds panels status` | Install or check the Desktop Agent Browser and Canvas panels |
-| `ds canvas show URL` | Open a local canvas beside the Desktop chat, else in the browser |
+| `ds chat id` | Print the conversation a Desktop chat's process belongs to |
 
 `ds verify` makes no model request. Matching history across accounts is separate from a
 successful inference request; different credential files alone do not prove distinct users
