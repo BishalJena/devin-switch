@@ -288,6 +288,34 @@ The agent never attaches to the Chrome you are using:
 `ds browser status` lists profiles and running instances, and `ds browser stop` closes them
 immediately. The server runs `npx -y chrome-devtools-mcp@1.10.1`, so Node.js is required.
 
+### Watch the agent's browser and canvas beside the chat
+
+`ds panels install` adds two panels to Devin Desktop (a small extension with no dependencies):
+
+```
+┌──────────── chat ────────────┬──────── Agent Browser / Canvas ────────┐
+│ you: why does login fail?    │ [profile ▾] ← → ⟳ [ address      ] ⦿ + │
+│ agent: opening the app…      │ ┌────────────────────────────────────┐ │
+│                              │ │  live view of the agent's Chrome   │ │
+│                              │ │  (click, type, scroll to take over)│ │
+│                              │ └────────────────────────────────────┘ │
+└──────────────────────────────┴────────────────────────────────────────┘
+```
+
+- **Agent Browser** (`Switch: Open Agent Browser`, or the globe in the status bar while an agent
+  browser runs) streams the agent's headless Chrome. It follows the tab the agent is using,
+  and you can click, type, paste, scroll, navigate, open tabs or pick another Chrome profile.
+  While the panel is open it holds the browser like a chat does, so Chrome stays open after
+  the agent is done; closing the panel releases it.
+- **Canvas** shows a live Excalidraw board from an Excalidraw MCP server such as
+  `excalidraw-live`. When an agent in a Desktop chat opens a canvas, it appears beside that
+  chat in the window showing the chat's folder. Terminal chats, or Desktop without the panels,
+  keep opening the browser. `Switch: Open Excalidraw Canvas` opens the workspace board itself
+  (setting `switchPanels.excalidrawCommand`, default `excalidraw-live`).
+
+Switch gives every chat `EXCALIDRAW_LIVE_OPEN="ds canvas show {url}"` unless you set that
+variable yourself. `ds panels status` shows the installed version.
+
 ### Switch accounts inside Devin Desktop (experimental)
 
 The **Devin Switch ACP agent** runs the installed Devin CLI inside Desktop's chat UI,
@@ -452,6 +480,8 @@ extension.
 | `ds browser status` | List Chrome profiles, cloned agent profiles and running instances |
 | `ds browser refresh PROFILE` | Copy a Chrome profile's logins into its agent profile again |
 | `ds browser stop [PROFILE]` | Close running agent browsers now |
+| `ds panels install` / `ds panels status` | Install or check the Desktop Agent Browser and Canvas panels |
+| `ds canvas show URL` | Open a local canvas beside the Desktop chat, else in the browser |
 
 `ds verify` makes no model request. Matching history across accounts is separate from a
 successful inference request; different credential files alone do not prove distinct users
