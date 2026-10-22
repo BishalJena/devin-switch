@@ -175,7 +175,7 @@ def execute(args: argparse.Namespace, store: Store) -> int:
     if args.command in ("canvas", "panels"):
         from devin_switch import panels
 
-        return panels.command(args)
+        return panels.command(args, store)
     if args.command == "acp":
         import asyncio
 

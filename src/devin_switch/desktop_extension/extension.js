@@ -6,19 +6,21 @@ const { readFileSync } = require('node:fs');
 const path = require('node:path');
 const { Cdp } = require('./cdp');
 const { BrowserView } = require('./browser');
+const { claim } = require('./requests');
 
 const STATUS_POLL_MS = 5000;
+const REQUEST_POLL_MS = 400;
 const HELPER_TIMEOUT_MS = 90_000;
 
-/** `ds` argv recorded by `ds panels install`, falling back to PATH. */
-function dsCommand(extensionPath) {
+/** `ds` argv and state folder recorded by `ds panels install`; falls back to `ds` on PATH. */
+function dsConfig(extensionPath) {
   try {
-    const { command } = JSON.parse(readFileSync(path.join(extensionPath, 'ds.json'), 'utf8'));
-    if (Array.isArray(command) && command.length) return command;
+    const { command, home } = JSON.parse(readFileSync(path.join(extensionPath, 'ds.json'), 'utf8'));
+    if (Array.isArray(command) && command.length) return { command, home: typeof home === 'string' ? home : null };
   } catch {
     // not installed through ds
   }
-  return ['ds'];
+  return { command: ['ds'], home: null };
 }
 
 /** JSON-lines client for `ds browser view`; one per window, holding at most one lease. */
@@ -257,7 +259,8 @@ async function openWorkspaceCanvas() {
 }
 
 function activate(context) {
-  const helper = new Helper(dsCommand(context.extensionPath));
+  const config = dsConfig(context.extensionPath);
+  const helper = new Helper(config.command);
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
   status.command = 'switchPanels.openBrowser';
   status.name = 'Agent Browser';
@@ -284,9 +287,22 @@ function activate(context) {
   void poll();
 
   const report = (error) => vscode.window.showErrorMessage(error.message);
+  // Canvas requests from chats: the window showing the chat's folder opens it, without a URI prompt.
+  const requests = config.home && path.join(config.home, 'panels', 'requests');
+  const requestTimer = requests && setInterval(() => {
+    const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+    for (const request of claim(requests, { folders, focused: vscode.window.state.focused })) {
+      try {
+        CanvasPanel.show(request.url);
+      } catch (error) {
+        report(error);
+      }
+    }
+  }, REQUEST_POLL_MS);
   context.subscriptions.push(
     status,
     { dispose: () => clearInterval(timer) },
+    { dispose: () => requestTimer && clearInterval(requestTimer) },
     { dispose: () => helper.dispose() },
     vscode.commands.registerCommand('switchPanels.openCanvas', (url) => (typeof url === 'string' ? Promise.resolve(CanvasPanel.show(url)) : openWorkspaceCanvas()).catch(report)),
     vscode.commands.registerCommand('switchPanels.openBrowser', () => BrowserPanel.show(context, helper)),
@@ -307,4 +323,4 @@ function activate(context) {
 
 function deactivate() {}
 
-module.exports = { activate, deactivate, dsCommand, embedUrl };
+module.exports = { activate, deactivate, dsConfig, embedUrl };

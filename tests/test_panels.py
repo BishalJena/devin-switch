@@ -3,7 +3,8 @@ import os
 import shlex
 import subprocess
 import sys
-import urllib.parse
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -46,22 +47,65 @@ def test_installed_version_reads_desktop_extensions_case_insensitively() -> None
     assert panels.installed_version() is None
 
 
-def test_gui_chats_with_panels_route_canvases_beside_the_chat(monkeypatch) -> None:
+def requests_folder(store) -> Path:
+    return store.root / "panels/requests"
+
+
+def claim_next(store, claimed: list) -> threading.Thread:
+    """Plays a Desktop window: claims the first request it sees, like the extension does."""
+
+    def run() -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            for path in requests_folder(store).glob("*.json"):
+                claimed.append(json.loads(path.read_text()))
+                path.unlink()
+                return
+            time.sleep(0.02)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_gui_chats_with_panels_hand_the_canvas_to_the_window_of_their_folder(
+    store, opener: Path, monkeypatch, tmp_path: Path
+) -> None:
     install_extension()
-    assert panels.canvas_target(CANVAS) == CANVAS, "terminal launches keep the browser"
     monkeypatch.setenv("DS_ACP_RUN_ID", "run-1")
-    target = urllib.parse.urlsplit(panels.canvas_target(CANVAS))
-    assert (target.scheme, target.netloc, target.path) == (
-        "devin",
-        "devin-switch.panels",
-        "/canvas",
-    )
-    assert urllib.parse.parse_qs(target.query) == {"url": [CANVAS]}
+    monkeypatch.chdir(tmp_path)
+    claimed: list = []
+    window = claim_next(store, claimed)
+    assert panels.show_canvas(store, CANVAS) == "Opened the canvas beside the chat."
+    window.join(5)
+    assert claimed[0]["url"] == CANVAS and claimed[0]["cwd"] == str(tmp_path)
+    assert abs(claimed[0]["at"] / 1000 - time.time()) < 30
+    assert not opener.exists(), "no browser tab when a window took it"
+    assert oct(requests_folder(store).stat().st_mode & 0o777) == "0o700"
 
 
-def test_gui_chats_without_panels_fall_back_to_the_browser(monkeypatch) -> None:
+def test_unclaimed_requests_fall_back_to_the_browser_and_leave_nothing_behind(
+    store, opener: Path, monkeypatch
+) -> None:
+    install_extension()
     monkeypatch.setenv("DS_ACP_RUN_ID", "run-1")
-    assert panels.canvas_target(CANVAS) == CANVAS
+    monkeypatch.setenv("DS_PANEL_TIMEOUT", "0.2")
+    assert panels.show_canvas(store, CANVAS) == "Opened the canvas in the browser."
+    assert json.loads(opener.read_text()) == ["-g", CANVAS]
+    assert list(requests_folder(store).glob("*")) == []
+
+
+@pytest.mark.parametrize("gui, panels_installed", [(False, True), (True, False)])
+def test_terminal_chats_or_missing_panels_use_the_browser_directly(
+    store, opener: Path, monkeypatch, gui: bool, panels_installed: bool
+) -> None:
+    if panels_installed:
+        install_extension()
+    if gui:
+        monkeypatch.setenv("DS_ACP_RUN_ID", "run-1")
+    assert panels.show_canvas(store, CANVAS) == "Opened the canvas in the browser."
+    assert json.loads(opener.read_text()) == ["-g", CANVAS]
+    assert not requests_folder(store).exists()
 
 
 @pytest.mark.parametrize(
@@ -73,16 +117,15 @@ def test_gui_chats_without_panels_fall_back_to_the_browser(monkeypatch) -> None:
         "javascript:alert(1)",
     ],
 )
-def test_only_local_http_canvas_urls_are_shown(url: str, monkeypatch) -> None:
+def test_only_local_http_canvas_urls_are_shown(url: str, store, opener: Path, monkeypatch) -> None:
     install_extension()
     monkeypatch.setenv("DS_ACP_RUN_ID", "run-1")
     with pytest.raises(SwitchError):
-        panels.canvas_target(url)
+        panels.show_canvas(store, url)
+    assert not opener.exists() and not requests_folder(store).exists()
 
 
-def test_canvas_show_command_opens_without_focus_and_rejects_foreign_urls(
-    opener: Path, monkeypatch, store
-) -> None:
+def test_canvas_show_command_hands_off_and_rejects_foreign_urls(opener: Path, store) -> None:
     install_extension()
     environment = {**os.environ, "DS_ACP_RUN_ID": "run-1"}
     run = lambda url: subprocess.run(  # noqa: E731
@@ -92,14 +135,14 @@ def test_canvas_show_command_opens_without_focus_and_rejects_foreign_urls(
         text=True,
         timeout=30,
     )
+    claimed: list = []
+    claim_next(store, claimed)
     shown = run(CANVAS)
     assert shown.returncode == 0, shown.stderr
-    assert "beside the chat" in shown.stdout
-    args = json.loads(opener.read_text())
-    assert args[0] == "-g" and args[1].startswith("devin://devin-switch.panels/canvas?url=")
+    assert "beside the chat" in shown.stdout and claimed[0]["url"] == CANVAS
     refused = run("http://evil.example/c/x")
     assert refused.returncode != 0 and "Only local http" in refused.stderr
-    assert len(opener.read_text().splitlines()) == 1
+    assert not opener.exists()
 
 
 def test_native_children_get_the_canvas_opener_unless_the_user_chose_one(
@@ -162,7 +205,7 @@ def test_vsix_holds_every_extension_file_a_valid_manifest_and_this_ds(tmp_path: 
     import xml.etree.ElementTree as ET
     import zipfile
 
-    vsix = panels.build_vsix(tmp_path)
+    vsix = panels.build_vsix(tmp_path, Path("/state/ds"))
     with zipfile.ZipFile(vsix) as archive:
         names = set(archive.namelist())
         package = json.loads(archive.read("extension/package.json"))
@@ -182,39 +225,40 @@ def test_vsix_holds_every_extension_file_a_valid_manifest_and_this_ds(tmp_path: 
         "Publisher": package["publisher"],
     }
     assert f"{package['publisher']}.{package['name']}" == panels.EXTENSION_ID
-    assert ds == {"command": [sys.executable, "-m", "devin_switch.cli"]}
+    assert ds == {"command": [sys.executable, "-m", "devin_switch.cli"], "home": "/state/ds"}
     assert vsix.name == f"{panels.EXTENSION_ID}-{package['version']}.vsix"
 
 
-def test_install_and_status_report_the_desktop_extension(desktop_cli: Path) -> None:
+def test_install_and_status_report_the_desktop_extension(desktop_cli: Path, store) -> None:
     version = panels.manifest()["version"]
     assert "not installed" in panels.status()
-    assert f"Installed the Switch panels {version}" in panels.install()
+    assert f"Installed the Switch panels {version}" in panels.install(store)
     assert panels.installed_version() == version
     assert panels.status() == f"Switch panels {version} are installed in the Desktop app."
     installed = panels.extensions_directory() / f"{panels.EXTENSION_ID}-{version}"
-    assert json.loads((installed / "ds.json").read_text())["command"][0] == sys.executable
+    ds = json.loads((installed / "ds.json").read_text())
+    assert ds["command"][0] == sys.executable and ds["home"] == str(store.root)
     install_extension("0.0.1")
     assert "is available, run: ds panels install" in panels.status()
 
 
-def test_install_surfaces_desktop_failures(desktop_cli: Path, monkeypatch) -> None:
+def test_install_surfaces_desktop_failures(desktop_cli: Path, monkeypatch, store) -> None:
     monkeypatch.setenv("FAKE_DESKTOP_FAIL", "1")
     with pytest.raises(SwitchError, match="boom: corrupt package"):
-        panels.install()
+        panels.install(store)
     monkeypatch.delenv("FAKE_DESKTOP_FAIL")
     monkeypatch.setenv("FAKE_DESKTOP_FORGET", "1")
     with pytest.raises(SwitchError, match="did not record"):
-        panels.install()
+        panels.install(store)
     monkeypatch.setenv("DS_DESKTOP_CLI", "/nonexistent/devin-desktop")
     with pytest.raises(SwitchError, match="command line tool is missing"):
-        panels.install()
+        panels.install(store)
 
 
 @pytest.mark.skipif(not panels.DESKTOP_CLI.exists(), reason="The Desktop app is not installed")
 def test_real_desktop_cli_accepts_the_vsix_in_an_isolated_extensions_dir(tmp_path: Path) -> None:
     extensions, user_data = tmp_path / "extensions", tmp_path / "user-data"
-    vsix = panels.build_vsix(tmp_path)
+    vsix = panels.build_vsix(tmp_path, tmp_path / "state")
     environment = {
         k: v for k, v in os.environ.items() if not k.startswith(("VSCODE_", "ELECTRON_"))
     }
