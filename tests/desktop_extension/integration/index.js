@@ -1,6 +1,7 @@
 'use strict';
 // Runs inside a real Desktop extension host (--extensionTestsPath). Driven by tests/test_desktop_extension.py.
 const vscode = require('vscode');
+const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -52,6 +53,7 @@ exports.run = async () => {
     // Chats started by this window carry the extension host's pid (WINDSURF_EXT_HOST_PID); the runner shares that process.
     const hostId = String(process.pid);
     results.hostId = hostId;
+    results.hostProcess = execFileSync('ps', ['-o', 'command=', '-p', hostId], { encoding: 'utf8', timeout: 5000 });
     await whiteboard('PUT', '/api/canvases/panel-test', { title: 'How MCP works', workspace, chat: 'chat-1' });
     // A chat whose folder this window doesn't show: only the window hint can route it here.
     await whiteboard('PUT', '/api/canvases/panel-test-2', { title: 'Auth flow', workspace: '/nonexistent/other-folder', chat: 'chat-2' });

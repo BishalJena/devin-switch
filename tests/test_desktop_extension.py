@@ -120,7 +120,10 @@ def test_real_desktop_shows_each_board_in_its_own_tab_and_watches_the_agent_brow
         result = json.loads(result_file.read_text())
         assert "error" not in result, result["error"]
         assert result["shown"] and result["canvasTab"]
+        # The window id is the extension host's pid: the process that also starts the window's
+        # chats with WINDSURF_EXT_HOST_PID=<its pid>.
         assert result["hostId"].isdigit() and int(result["hostId"]) != os.getpid()
+        assert "--utility-sub-type=node.mojom.NodeService" in result["hostProcess"]
         # Never in an unrelated window; the window's extension-host pid routes a board here.
         assert result["foreign"] == {"noHint": 409, "otherWindow": 409}
         assert result["shownByHint"] == 200 and result["secondTab"]
