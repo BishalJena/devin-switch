@@ -309,9 +309,11 @@ immediately. The server runs `npx -y chrome-devtools-mcp@1.10.1`, so Node.js is 
   the agent is done; closing the panel releases it.
 - **Whiteboard** shows boards from
   [whiteboard-mcp](https://github.com/ansuman-shukla/whiteboard-mcp). Each chat gets its own
-  board, and when the agent explains something visually it opens beside the chat in the window
-  showing that chat's folder, for every Desktop chat. The extension connects to the whiteboard
-  daemon directly, so no browser tab and no restart of open chats is needed.
+  board, and when the agent explains something visually it opens beside the chat in that chat's
+  own window, in its own tab named after the board. Other chats' boards keep their tabs, and a
+  window never shows a board from a chat in another window (that window has to run the panels
+  too: reload windows opened before an update). The extension connects to the whiteboard daemon
+  directly, so no browser tab and no restart of open chats is needed.
   `Switch: Open Whiteboard` lists this workspace's boards (newest first) so you can reopen one
   yourself. Setting `switchPanels.whiteboardHome` points at a non-default `WHITEBOARD_HOME`.
 
