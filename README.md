@@ -21,8 +21,8 @@ saved Devin CLI logins, checking reported usage, and reopening shared local conv
 - **Concurrent launches.** Open multiple sessions while protecting profiles from removal or
   replacement login while in use.
 
-There is no automatic quota failover, interrupted-request retry, or guarantee that a different
-account can continue every conversation. `ds next` cycles through saved logins; it does not
+Automatic failover only uses logins with confirmed remaining usage, and there is no guarantee
+that a different account can continue every conversation. `ds next` cycles through saved logins; it does not
 select an account based on remaining quota. Switch does not change the Devin Desktop IDE account.
 
 ## Quick start
@@ -191,7 +191,15 @@ the most remaining usage (using the same ranking as `!ds switch`), then sends ex
 It also makes that login the default. This setting applies to every chat right away, with no
 restart needed. If the setting file is unreadable, automatic switching stays off.
 
-- **GUI chats** use the native CLI's typed quota signals: a `-32011` / `resource_exhausted`
+- **GUI chats keep running, subagents included.** Each GUI chat with a saved API login routes
+  its agent's API traffic through a private loopback relay. When a request comes back with
+  "usage quota has been exhausted", the relay picks the next login with confirmed remaining
+  usage and replays that same request with it, inside the same agent process. Running
+  subagents keep their context and finish normally, `read_subagent` sees nothing unusual, and
+  no `continue` is sent. The chat, its session list entry and the default move to the new
+  login. Nothing is written to saved credentials, and keys are never logged.
+- **Fallback for GUI chats** (no saved API login, host login failed, or no login could take
+  over) uses the native CLI's typed quota signals: a `-32011` / `resource_exhausted`
   prompt error, or an `agent_stopped` event with cause `quota_exhausted`. The switch and the
   `continue` happen inside the same Desktop turn, so output keeps streaming into the chat.
   Rate limits that include a retry delay do not trigger a switch. Stopping the turn in Desktop

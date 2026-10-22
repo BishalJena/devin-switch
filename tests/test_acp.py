@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
+from fake_upstream import Upstream
 
 from devin_switch import acp, acp_state, cli, desktop, sessions, usage
 from devin_switch.native import Native
@@ -1640,5 +1641,182 @@ def test_gui_auto_switch_toggle_is_global_and_local(acp_native, tmp_path):
             await client.prompt(session_id, "/auto-switch on")
             assert acp.handoff.auto_switch_enabled(acp_native.store)
             assert not prompts(acp_native)
+
+    asyncio.run(scenario())
+
+
+@pytest.fixture
+def relayed(acp_native, tmp_path, monkeypatch):
+    """Saved API logins for every fake account, served by an offline API upstream."""
+    store = acp_native.store
+    with store.lock():
+        store.add("ansuman-3", None)
+    names = [account.name for account in store.accounts()]
+    upstream = Upstream(names)
+    for name in names:
+        store.credentials(store.account(name)).write_text(upstream.credentials(name))
+    monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(tmp_path / "subagents-may-infer"))
+    yield upstream
+    upstream.close()
+
+
+def texts(messages):
+    return [
+        message["params"]["update"]["content"]["text"]
+        for message in messages
+        if message.get("method") == "session/update"
+        and message["params"]["update"].get("sessionUpdate") == "agent_message_chunk"
+    ]
+
+
+async def until(predicate, timeout=10):
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0.02)
+
+
+def subagent_events(messages, key):
+    return [
+        message["params"]["update"]["_meta"][key]
+        for message in messages
+        if message.get("method") == "session/update"
+        and key in (message["params"]["update"].get("_meta") or {})
+    ]
+
+
+def secrets_absent(native, upstream, messages):
+    exposed = json.dumps(messages) + "".join(json.dumps(call) for call in logged(native))
+    return not any(key in exposed for key in upstream.keys)
+
+
+def test_gui_relay_keeps_subagents_running_when_usage_runs_out_mid_task(
+    acp_native, relayed, tmp_path, monkeypatch
+):
+    store = acp_native.store
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage(exhausted={"ansuman-3"}))
+    saved = {
+        name: store.credentials(store.account(name)).read_text() for name in relayed.keys.values()
+    }
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            chat = bridge.chats[session_id]
+            pid = chat.backend.process.pid
+            turn = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "subagents"))
+            )
+            await until(
+                lambda: len(subagent_events(messages, "cognition.ai/subagent_started")) == 2
+            )
+            relayed.exhausted = {"ansuman-1"}
+            Path(os.environ["FAKE_SUBAGENT_GATE"]).touch()
+            assert await turn == {"stopReason": "end_turn"}
+
+            reply = [json.loads(text) for text in texts(messages) if '"subagents"' in text]
+            assert reply == [
+                {
+                    "account": "ansuman-1",
+                    "session": session_id,
+                    "upstream": "reply from ansuman-2",
+                    "subagents": {"s1": "reply from ansuman-2", "s2": "reply from ansuman-2"},
+                }
+            ]
+            completed = subagent_events(messages, "cognition.ai/subagent_completed")
+            assert sorted((event["agentId"], event["success"]) for event in completed) == [
+                ("s1", True),
+                ("s2", True),
+            ]
+            # One native process and one turn: no restart, no replayed or "continue" prompt.
+            assert chat.backend.process.pid == pid
+            assert prompts(acp_native) == [("ansuman-1", "subagents")]
+            assert [c["method"] for c in logged(acp_native)].count("authenticate") == 1
+            calls = relayed.inference()
+            assert all(header == body for header, body in calls)
+            assert calls[0] == ("ansuman-1", "ansuman-1")
+            assert [header for header, _ in calls].count("ansuman-2") == 3
+            assert [header for header, _ in calls[1:]].count("ansuman-1") in (1, 2)
+
+            assert chat.backend.account.name == "ansuman-2"
+            assert acp_state.bound_account(store, session_id).name == "ansuman-2"
+            assert store.selected().name == "ansuman-2"
+            run = json.loads(
+                (store.root / "runs" / f"{chat.backend.lease.run.id}.json").read_text()
+            )
+            assert run["account"] == "ansuman-2"
+            assert "out of usage" not in json.dumps(messages)
+            assert secrets_absent(acp_native, relayed, messages)
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "infer"))
+            assert relayed.inference()[-1] == ("ansuman-2", "ansuman-2")
+
+    asyncio.run(scenario())
+    assert saved == {
+        name: store.credentials(store.account(name)).read_text() for name in relayed.keys.values()
+    }
+
+
+@pytest.mark.parametrize("case", ["auto-switch-off", "no-login-left"])
+def test_gui_relay_returns_quota_unchanged_when_it_cannot_rotate(
+    acp_native, relayed, tmp_path, monkeypatch, case
+):
+    store = acp_native.store
+    left = {"ansuman-1"} if case == "auto-switch-off" else {"ansuman-1", "ansuman-2", "ansuman-3"}
+    monkeypatch.setattr(usage, "refresh_account", fresh_usage(exhausted=left))
+    if case == "auto-switch-off":
+        acp.handoff.set_auto_switch(store, False)
+    relayed.exhausted = {"ansuman-1"}
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            with pytest.raises(acp.RpcError) as raised:
+                await bridge.dispatch("session/prompt", prompt_params(session_id, "infer"))
+            assert raised.value.code == -32011
+            assert relayed.inference() == [("ansuman-1", "ansuman-1")]
+            assert bridge.chats[session_id].backend.account.name == "ansuman-1"
+            assert store.selected().name == "ansuman-1"
+            assert acp_state.bound_account(store, session_id).name == "ansuman-1"
+            assert prompts(acp_native) == [("ansuman-1", "infer")]
+
+    asyncio.run(scenario())
+
+
+def test_gui_relay_issues_each_handoff_destination_its_own_login(acp_native, relayed, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            first = bridge.chats[session_id].backend
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "/switch ansuman-2"))
+            assert first.relay is None
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "infer"))
+            assert relayed.inference() == [("ansuman-2", "ansuman-2")]
+
+    asyncio.run(scenario())
+
+
+def test_gui_failed_host_login_keeps_saved_credentials(acp_native, relayed, tmp_path):
+    relayed.close()
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            assert bridge.chats[session_id].backend.relay is None
+            assert await bridge.dispatch("session/prompt", prompt_params(session_id, "work")) == {
+                "stopReason": "end_turn"
+            }
+
+    asyncio.run(scenario())
+
+
+def test_gui_chats_without_a_saved_api_login_skip_the_relay(acp_native, tmp_path):
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            assert bridge.chats[created["sessionId"]].backend.relay is None
+            assert "authenticate" not in [call["method"] for call in logged(acp_native)]
 
     asyncio.run(scenario())

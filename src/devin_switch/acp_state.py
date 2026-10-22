@@ -255,6 +255,14 @@ class Lease:
             self.run = replace(self.run, session_id=session_id)
             write_json(self.path, asdict(self.run))
 
+    def adopt(self, account: Account) -> None:
+        """Record that this live run now uses another login, holding it like the first."""
+        with self.store.lock(timeout=5):
+            self.store.account(account.name)
+            self.stack.enter_context(self.store.account_lock(account, shared=True))
+            self.run = replace(self.run, account=account.name)
+            write_json(self.path, asdict(self.run))
+
     def close(self, *, ended: bool) -> None:
         if self.closed:
             return

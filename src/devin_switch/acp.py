@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from devin_switch import acp_state, handoff, sessions
+from devin_switch import acp_state, handoff, relay, sessions
 from devin_switch.native import Native
 from devin_switch.store import Account, SwitchError, write_json
 
@@ -167,6 +167,8 @@ class Backend:
         self.suppress_replay = False
         self.stopping = False
         self.stop_cause = None
+        self.relay = None
+        self.loop = None
         self.last_activity = time.monotonic()
         bridge.backends.add(self)
 
@@ -227,10 +229,36 @@ class Backend:
                 raise SwitchError(
                     "This native CLI lacks compatible ACP session loading. Update Devin CLI."
                 )
+            if self.chat and (issued := relay.login(self.bridge.native.store, self.account)):
+                await self.authenticate(issued)
             return result
         except BaseException:
             await self.close()
             raise
+
+    async def authenticate(self, issued):
+        """Route the native's API traffic through a relay that can change logins in place."""
+        self.loop = asyncio.get_running_loop()
+        self.relay = relay.Relay(
+            issued, lambda current, tried: self.bridge.rotate(self, issued, current, tried)
+        )
+        try:
+            await self.request(
+                "authenticate",
+                {
+                    "methodId": "windsurf-api-key",
+                    "_meta": {"api_key": issued.key, "api_server_url": self.relay.url},
+                },
+                LIFECYCLE_TIMEOUT,
+            )
+        except RpcError:
+            # A failed host login (e.g. offline) leaves the native on its saved credentials.
+            await asyncio.to_thread(self.close_relay)
+
+    def close_relay(self):
+        if self.relay:
+            closing, self.relay = self.relay, None
+            closing.close()
 
     async def send(self, message):
         if not self.process or self.process.poll() is not None or self.writer.is_closing():
@@ -337,6 +365,7 @@ class Backend:
         self.lease.close(ended=True)
         self.bridge.drop_client_requests(self)
         self.close_pipes()
+        await asyncio.to_thread(self.close_relay)
 
     async def close(self):
         self.stopping = True
@@ -349,6 +378,7 @@ class Backend:
                 await asyncio.wait_for(asyncio.shield(self.watcher), SHUTDOWN_TIMEOUT)
             except TimeoutError:
                 return False
+        await asyncio.to_thread(self.close_relay)
         if self.lease:
             self.lease.close(ended=True)
         self.bridge.backends.discard(self)
@@ -1058,6 +1088,26 @@ class Bridge:
                 else "Send your next message when ready."
             ),
         )
+
+    def rotate(self, backend, issued, current, tried):
+        """Pick the relay's next login when every login in `tried` ran out (relay thread)."""
+        store = self.native.store
+        try:
+            if not handoff.auto_switch_enabled(store):
+                return None
+            account, _ = handoff.choose_best(self.native, current.account.name, tried)
+            replacement = relay.login(store, account)
+            if replacement is None or not relay.compatible(issued, replacement):
+                return None
+            backend.lease.adopt(account)
+            with store.lock(timeout=5):
+                if backend.session_id:
+                    acp_state.bind(store, backend.session_id, account)
+                store.select(account)
+        except (SwitchError, OSError):
+            return None
+        backend.loop.call_soon_threadsafe(setattr, backend, "account", account)
+        return replacement
 
     async def queued_switch(self, chat, path):
         try:
