@@ -109,6 +109,12 @@ def parser() -> argparse.ArgumentParser:
     stop.add_argument("profile", nargs="?")
     actions.add_parser("mcp", help="Serve the browser MCP server over stdio (started by Devin)")
     actions.add_parser("view", help="Serve the Desktop browser panel over stdio (JSON lines)")
+    canvas = commands.add_parser("canvas", help="Show live Excalidraw canvases")
+    canvas_actions = canvas.add_subparsers(dest="action", required=True, metavar="ACTION")
+    show = canvas_actions.add_parser(
+        "show", help="Open a local canvas URL beside the Desktop chat, else in the browser"
+    )
+    show.add_argument("url")
     supervise = actions.add_parser("_supervise")
     supervise.add_argument("profile")
     supervise.add_argument("--token", required=True)
@@ -160,6 +166,10 @@ def execute(args: argparse.Namespace, store: Store) -> int:
         from devin_switch import agent_browser
 
         return agent_browser.command(args, store)
+    if args.command == "canvas":
+        from devin_switch import panels
+
+        return panels.command(args)
     if args.command == "acp":
         import asyncio
 
