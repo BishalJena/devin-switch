@@ -11,7 +11,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
-from devin_switch.panels import OPEN_ENVIRONMENT, opener_command
+from devin_switch.executable import ds_command
 from devin_switch.store import Account, Store, SwitchError
 
 BUNDLED_CLI = Path(
@@ -107,7 +107,8 @@ class Native:
             "DS_HOME": str(self.store.root),
             "DS_BINARY": str(self.binary),
         }
-        environment.setdefault(OPEN_ENVIRONMENT, opener_command())
+        # Lets the whiteboard MCP keep one board per conversation across account handoffs.
+        environment.setdefault("WHITEBOARD_CHAT_COMMAND", ds_command("chat", "id"))
         if self.run_id:
             environment.update(
                 DS_RUN_ID=self.run_id,

@@ -3,8 +3,6 @@ import os
 import shlex
 import subprocess
 import sys
-import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -47,125 +45,46 @@ def test_installed_version_reads_desktop_extensions_case_insensitively() -> None
     assert panels.installed_version() is None
 
 
-def requests_folder(store) -> Path:
-    return store.root / "panels/requests"
-
-
-def claim_next(store, claimed: list) -> threading.Thread:
-    """Plays a Desktop window: claims the first request it sees, like the extension does."""
-
-    def run() -> None:
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            for path in requests_folder(store).glob("*.json"):
-                claimed.append(json.loads(path.read_text()))
-                path.unlink()
-                return
-            time.sleep(0.02)
-
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    return thread
-
-
-def test_gui_chats_with_panels_hand_the_canvas_to_the_window_of_their_folder(
-    store, opener: Path, monkeypatch, tmp_path: Path
+def test_native_children_get_the_chat_id_command_unless_one_is_set(
+    native: Native, monkeypatch
 ) -> None:
-    install_extension()
-    monkeypatch.setenv("DS_ACP_RUN_ID", "run-1")
-    monkeypatch.chdir(tmp_path)
-    claimed: list = []
-    window = claim_next(store, claimed)
-    assert panels.show_canvas(store, CANVAS) == "Opened the canvas beside the chat."
-    window.join(5)
-    assert claimed[0]["url"] == CANVAS and claimed[0]["cwd"] == str(tmp_path)
-    assert abs(claimed[0]["at"] / 1000 - time.time()) < 30
-    assert not opener.exists(), "no browser tab when a window took it"
-    assert oct(requests_folder(store).stat().st_mode & 0o777) == "0o700"
+    account = native.store.accounts()[0]
+    command = shlex.split(native.environment(account)["WHITEBOARD_CHAT_COMMAND"])
+    assert command == [sys.executable, "-m", "devin_switch.cli", "chat", "id"]
+    assert "WHITEBOARD_OPEN" not in native.environment(account)
+    monkeypatch.setenv("WHITEBOARD_CHAT_COMMAND", "echo fixed")
+    assert native.environment(account)["WHITEBOARD_CHAT_COMMAND"] == "echo fixed"
 
 
-def test_unclaimed_requests_fall_back_to_the_browser_and_leave_nothing_behind(
-    store, opener: Path, monkeypatch
-) -> None:
-    install_extension()
-    monkeypatch.setenv("DS_ACP_RUN_ID", "run-1")
-    monkeypatch.setenv("DS_PANEL_TIMEOUT", "0.2")
-    assert panels.show_canvas(store, CANVAS) == "Opened the canvas in the browser."
-    assert json.loads(opener.read_text()) == ["-g", CANVAS]
-    assert list(requests_folder(store).glob("*")) == []
+def test_chat_id_command_survives_paths_with_spaces(monkeypatch) -> None:
+    from devin_switch.executable import ds_command
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", "/Applications/Devin Switch.app/Contents/ds")
+    assert shlex.split(ds_command("chat", "id")) == [
+        "/Applications/Devin Switch.app/Contents/ds",
+        "chat",
+        "id",
+    ]
 
 
-@pytest.mark.parametrize("gui, panels_installed", [(False, True), (True, False)])
-def test_terminal_chats_or_missing_panels_use_the_browser_directly(
-    store, opener: Path, monkeypatch, gui: bool, panels_installed: bool
-) -> None:
-    if panels_installed:
-        install_extension()
-    if gui:
-        monkeypatch.setenv("DS_ACP_RUN_ID", "run-1")
-    assert panels.show_canvas(store, CANVAS) == "Opened the canvas in the browser."
-    assert json.loads(opener.read_text()) == ["-g", CANVAS]
-    assert not requests_folder(store).exists()
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://127.0.0.1:1/c/x",
-        "http://example.com/c/x",
-        "file:///etc/passwd",
-        "javascript:alert(1)",
-    ],
-)
-def test_only_local_http_canvas_urls_are_shown(url: str, store, opener: Path, monkeypatch) -> None:
-    install_extension()
-    monkeypatch.setenv("DS_ACP_RUN_ID", "run-1")
-    with pytest.raises(SwitchError):
-        panels.show_canvas(store, url)
-    assert not opener.exists() and not requests_folder(store).exists()
-
-
-def test_canvas_show_command_hands_off_and_rejects_foreign_urls(opener: Path, store) -> None:
-    install_extension()
-    environment = {**os.environ, "DS_ACP_RUN_ID": "run-1"}
-    run = lambda url: subprocess.run(  # noqa: E731
-        (sys.executable, "-m", "devin_switch.cli", "canvas", "show", url),
-        env=environment,
+def test_chat_id_outside_a_gui_chat_fails_without_guessing(store) -> None:
+    done = subprocess.run(
+        (sys.executable, "-m", "devin_switch.cli", "chat", "id"),
         capture_output=True,
         text=True,
         timeout=30,
     )
-    claimed: list = []
-    claim_next(store, claimed)
-    shown = run(CANVAS)
-    assert shown.returncode == 0, shown.stderr
-    assert "beside the chat" in shown.stdout and claimed[0]["url"] == CANVAS
-    refused = run("http://evil.example/c/x")
-    assert refused.returncode != 0 and "Only local http" in refused.stderr
-    assert not opener.exists()
-
-
-def test_native_children_get_the_canvas_opener_unless_the_user_chose_one(
-    native: Native, monkeypatch
-) -> None:
-    account = native.store.accounts()[0]
-    template = native.environment(account)[panels.OPEN_ENVIRONMENT]
-    argv = shlex.split(template.replace("{url}", shlex.quote(CANVAS)))
-    assert argv[-3:] == ["canvas", "show", CANVAS]
-    monkeypatch.setenv(panels.OPEN_ENVIRONMENT, "none")
-    assert native.environment(account)[panels.OPEN_ENVIRONMENT] == "none"
-
-
-def test_opener_template_survives_paths_with_spaces(monkeypatch) -> None:
-    monkeypatch.setattr(sys, "frozen", True, raising=False)
-    monkeypatch.setattr(sys, "executable", "/Applications/Devin Switch.app/Contents/ds")
-    template = panels.opener_command()
-    assert shlex.split(template) == [
-        "/Applications/Devin Switch.app/Contents/ds",
-        "canvas",
-        "show",
-        "{url}",
-    ]
+    assert done.returncode != 0 and done.stdout == ""
+    assert "Not inside a Desktop chat launched through Switch" in done.stderr
+    stale = subprocess.run(
+        (sys.executable, "-m", "devin_switch.cli", "chat", "id"),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "DS_ACP_RUN_ID": "not-a-live-run"},
+    )
+    assert stale.returncode != 0 and stale.stdout == ""
 
 
 FAKE_DESKTOP_CLI = """\

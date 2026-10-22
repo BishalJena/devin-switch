@@ -109,12 +109,9 @@ def parser() -> argparse.ArgumentParser:
     stop.add_argument("profile", nargs="?")
     actions.add_parser("mcp", help="Serve the browser MCP server over stdio (started by Devin)")
     actions.add_parser("view", help="Serve the Desktop browser panel over stdio (JSON lines)")
-    canvas = commands.add_parser("canvas", help="Show live whiteboards")
-    canvas_actions = canvas.add_subparsers(dest="action", required=True, metavar="ACTION")
-    show = canvas_actions.add_parser(
-        "show", help="Open a local canvas URL beside the Desktop chat, else in the browser"
-    )
-    show.add_argument("url")
+    chat = commands.add_parser("chat", help="Inspect the Desktop chat this process belongs to")
+    chat_actions = chat.add_subparsers(dest="action", required=True, metavar="ACTION")
+    chat_actions.add_parser("id", help="Print the conversation id (used by the whiteboard MCP)")
     side = commands.add_parser(
         "panels", help="Install the Desktop side panels (whiteboard, agent browser)"
     )
@@ -172,10 +169,15 @@ def execute(args: argparse.Namespace, store: Store) -> int:
         from devin_switch import agent_browser
 
         return agent_browser.command(args, store)
-    if args.command in ("canvas", "panels"):
+    if args.command == "panels":
         from devin_switch import panels
 
         return panels.command(args, store)
+    if args.command == "chat":
+        from devin_switch import acp_state
+
+        print(acp_state.current_chat(store))
+        return 0
     if args.command == "acp":
         import asyncio
 

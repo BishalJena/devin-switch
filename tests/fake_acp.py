@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -118,6 +119,15 @@ def update(session_id, change):
     emit({"method": "session/update", "params": {"sessionId": session_id, "update": change}})
 
 
+def whiteboard_chat(params):
+    """Runs the chat-id command an MCP server would get, only when a test asks for it."""
+    if (params.get("prompt") or [{}])[0].get("text") != "whiteboard-chat":
+        return None
+    command = shlex.split(os.environ["WHITEBOARD_CHAT_COMMAND"])
+    done = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    return done.stdout.strip() if done.returncode == 0 else f"error: {done.stderr.strip()}"
+
+
 async def handle(message):
     global loaded, project, host
     method, params = message["method"], message.get("params", {})
@@ -133,6 +143,7 @@ async def handle(message):
                         "args": sys.argv[1:],
                         "gh_config_dir": os.environ.get("GH_CONFIG_DIR"),
                         "text": (params.get("prompt") or [{}])[0].get("text"),
+                        "chat_id": whiteboard_chat(params),
                     }
                 )
                 + "\n"

@@ -2,22 +2,18 @@
 
 import json
 import os
-import shlex
 import subprocess
 import tempfile
-import time
-import urllib.parse
 import zipfile
 from pathlib import Path
 from xml.sax.saxutils import escape
 
 from devin_switch.executable import command_prefix
-from devin_switch.store import Store, SwitchError, private_directory, write_json
+from devin_switch.store import Store, SwitchError
 
 PUBLISHER = "devin-switch"
 NAME = "panels"
 EXTENSION_ID = f"{PUBLISHER}.{NAME}"
-OPEN_ENVIRONMENT = "WHITEBOARD_OPEN"
 
 
 def extensions_directory() -> Path:
@@ -34,47 +30,6 @@ def installed_version() -> str | None:
         if str(identifier.get("id", "")).lower() == EXTENSION_ID:
             return str(entry.get("version") or "")
     return None
-
-
-def opener_command() -> str:
-    """The `{url}` template the whiteboard MCP runs to show a canvas."""
-    return f"{shlex.join([*command_prefix(), 'canvas', 'show'])} {{url}}"
-
-
-def check_canvas_url(url: str) -> None:
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost"):
-        raise SwitchError("Only local http canvas URLs can be shown.")
-
-
-def request_panel(store: Store, url: str) -> bool:
-    """Ask the Desktop window showing this folder to open the canvas; False if none claims it."""
-    folder = store.root / "panels/requests"
-    for path in (store.root / "panels", folder):
-        private_directory(path)
-    request = folder / f"{time.time_ns()}-{os.getpid()}.json"
-    write_json(request, {"url": url, "cwd": os.getcwd(), "at": int(time.time() * 1000)})
-    deadline = time.monotonic() + float(os.environ.get("DS_PANEL_TIMEOUT") or 3)
-    while time.monotonic() < deadline:
-        if not request.exists():
-            return True
-        time.sleep(0.05)
-    try:
-        request.unlink()
-    except FileNotFoundError:
-        return True  # claimed at the last moment
-    return False
-
-
-def show_canvas(store: Store, url: str) -> str:
-    check_canvas_url(url)
-    gui = os.environ.get("DS_ACP_RUN_ID") and installed_version() is not None
-    if gui and request_panel(store, url):
-        return "Opened the canvas beside the chat."
-    opener = os.environ.get("DS_OPEN") or "/usr/bin/open"
-    # -g opens the browser without stealing focus from the chat.
-    subprocess.run((opener, "-g", url), check=True, timeout=15, stdin=subprocess.DEVNULL)
-    return "Opened the canvas in the browser."
 
 
 SOURCE = Path(__file__).parent / "desktop_extension"
@@ -162,7 +117,7 @@ def install(store: Store) -> str:
         (
             f"Installed the Switch panels {version} into the Desktop app.",
             "Commands: 'Switch: Open Whiteboard' and 'Switch: Open Agent Browser'.",
-            "Canvases from GUI chats now open beside the chat; terminal chats keep the browser.",
+            "Whiteboards from chats now open beside the chat in the window showing their folder.",
             "If the commands are missing, run 'Developer: Reload Window' once.",
         )
     )
@@ -177,9 +132,7 @@ def status() -> str:
 
 
 def command(args, store: Store) -> int:
-    if args.action == "show":
-        print(show_canvas(store, args.url))
-    elif args.action == "install":
+    if args.action == "install":
         print(install(store))
     elif args.action == "status":
         print(status())
