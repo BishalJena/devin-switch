@@ -48,9 +48,10 @@ function makeHost(overrides = {}) {
     home: '/home/u/.whiteboard-mcp',
     folders: () => state.folders,
     focused: () => state.focused,
-    onShow: async (url, title) => {
+    hostId: '45824',
+    onShow: async ({ canvasId, url, title }) => {
       if (title === 'boom') throw new Error('panel failed');
-      shown.push({ url, title });
+      shown.push({ canvasId, url, title });
     },
     WebSocketImpl: FakeSocket,
     readFile: files({ 'daemon.json': JSON.stringify({ port: 47428, pid: 1 }), token: 'tok\n' }),
@@ -71,14 +72,15 @@ test('whiteboardHome honours the setting, then WHITEBOARD_HOME, then ~/.whiteboa
   if (saved !== undefined) process.env.WHITEBOARD_HOME = saved;
 });
 
-test('says hello with its folders, opens shown boards with a tokenised URL and reports the outcome', async () => {
+test('says hello with its window id and folders, opens shown boards with a tokenised URL and reports the outcome', async () => {
   const { host, shown, state } = makeHost();
   host.start();
   await tick();
   const socket = FakeSocket.all[0];
   assert.equal(socket.url, 'ws://127.0.0.1:47428/ws/host?token=tok');
   socket.open();
-  assert.deepEqual(socket.sent[0], { t: 'hello', folders: ['/work/app'], focused: true });
+  // The daemon routes a chat's board to the window whose id matches the chat's WINDSURF_EXT_HOST_PID.
+  assert.deepEqual(socket.sent[0], { t: 'hello', hostId: '45824', folders: ['/work/app'], focused: true });
 
   state.focused = false;
   host.update();
@@ -86,7 +88,7 @@ test('says hello with its folders, opens shown boards with a tokenised URL and r
 
   socket.emit('message', { data: JSON.stringify({ t: 'show', reqId: 'r1', canvasId: 'app-1a2b3c', title: 'How MCP works' }) });
   await tick();
-  assert.deepEqual(shown, [{ url: 'http://127.0.0.1:47428/c/app-1a2b3c?token=tok', title: 'How MCP works' }]);
+  assert.deepEqual(shown, [{ canvasId: 'app-1a2b3c', url: 'http://127.0.0.1:47428/c/app-1a2b3c?token=tok', title: 'How MCP works' }]);
   assert.deepEqual(socket.sent[2], { t: 'shown', reqId: 'r1', ok: true });
 
   socket.emit('message', { data: JSON.stringify({ t: 'show', reqId: 'r2', canvasId: 'x', title: 'boom' }) });

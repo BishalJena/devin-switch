@@ -1,6 +1,7 @@
 'use strict';
 // Runs inside a real Desktop extension host (--extensionTestsPath). Driven by tests/test_desktop_extension.py.
 const vscode = require('vscode');
+const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -49,14 +50,38 @@ exports.run = async () => {
   try {
     await vscode.extensions.getExtension('devin-switch.panels').activate();
     const workspace = vscode.workspace.workspaceFolders[0].uri.fsPath;
+    // Chats started by this window carry the extension host's pid (WINDSURF_EXT_HOST_PID); the runner shares that process.
+    const hostId = String(process.pid);
+    results.hostId = hostId;
+    results.hostProcess = execFileSync('ps', ['-o', 'command=', '-p', hostId], { encoding: 'utf8', timeout: 5000 });
     await whiteboard('PUT', '/api/canvases/panel-test', { title: 'How MCP works', workspace, chat: 'chat-1' });
+    // A chat whose folder this window doesn't show: only the window hint can route it here.
+    await whiteboard('PUT', '/api/canvases/panel-test-2', { title: 'Auth flow', workspace: '/nonexistent/other-folder', chat: 'chat-2' });
     // The extension connects to the daemon as a panel host within a few seconds.
-    results.shown = await waitFor('the daemon to reach the panel host', async () => (await whiteboard('POST', '/api/canvases/panel-test/show', { workspace })).status === 200);
+    results.shown = await waitFor('the daemon to reach the panel host', async () => (await whiteboard('POST', '/api/canvases/panel-test/show', { workspace, host: hostId })).status === 200);
     results.canvasTab = await waitFor('the board tab titled after the topic', () => tabLabels().includes('How MCP works'));
-    results.viewers = await waitFor('the embedded viewer to connect live', async () => {
+    results.foreign = {
+      // Never shown in an unrelated window: neither by folder nor for another window's id.
+      noHint: (await whiteboard('POST', '/api/canvases/panel-test-2/show', { workspace: '/nonexistent/other-folder' })).status,
+      otherWindow: (await whiteboard('POST', '/api/canvases/panel-test-2/show', { workspace: '/nonexistent/other-folder', host: '1' })).status,
+    };
+    results.shownByHint = (await whiteboard('POST', '/api/canvases/panel-test-2/show', { workspace: '/nonexistent/other-folder', host: hostId })).status;
+    results.secondTab = await waitFor('a second tab for the second board', () => tabLabels().includes('Auth flow'));
+    const viewers = async () => {
       const { body } = await whiteboard('GET', '/api/canvases');
-      return body.find((b) => b.id === 'panel-test')?.viewers || 0;
+      return Object.fromEntries(['panel-test', 'panel-test-2'].map((id) => [id, body.find((b) => b.id === id)?.viewers || 0]));
+    };
+    results.viewers = await waitFor('both boards to have a live viewer', async () => {
+      const counts = await viewers();
+      return counts['panel-test'] > 0 && counts['panel-test-2'] > 0 && counts;
     });
+    results.reshown = (await whiteboard('POST', '/api/canvases/panel-test/show', { workspace, host: hostId })).status;
+    results.active = await waitFor('the first board to be revealed', () => {
+      const label = vscode.window.tabGroups.all.map((g) => g.activeTab?.label).find((l) => l === 'How MCP works' || l === 'Auth flow');
+      return label === 'How MCP works' && label;
+    });
+    results.boardTabs = tabLabels().filter((l) => l === 'How MCP works' || l === 'Auth flow');
+    results.viewersAfter = await viewers();
 
     await vscode.commands.executeCommand('switchPanels.openBrowser');
     results.browserTab = await waitFor('the Agent Browser tab', () => tabLabels().includes('Agent Browser'));

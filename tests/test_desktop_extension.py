@@ -43,7 +43,7 @@ def free_port() -> int:
     or not WHITEBOARD,
     reason="Opens a real, isolated Desktop window with whiteboard-mcp; set DS_TEST_DESKTOP=1",
 )
-def test_real_desktop_shows_whiteboards_beside_the_chat_and_watches_the_agent_browser(
+def test_real_desktop_shows_each_board_in_its_own_tab_and_watches_the_agent_browser(
     tmp_path: Path, store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from devin_switch import agent_browser, browser, panels
@@ -119,7 +119,19 @@ def test_real_desktop_shows_whiteboards_beside_the_chat_and_watches_the_agent_br
         assert result_file.exists(), (launched.stdout + launched.stderr)[-3000:]
         result = json.loads(result_file.read_text())
         assert "error" not in result, result["error"]
-        assert result["shown"] and result["canvasTab"] and result["viewers"] >= 1
+        assert result["shown"] and result["canvasTab"]
+        # The window id is the extension host's pid: the process that also starts the window's
+        # chats with WINDSURF_EXT_HOST_PID=<its pid>.
+        assert result["hostId"].isdigit() and int(result["hostId"]) != os.getpid()
+        assert "--utility-sub-type=node.mojom.NodeService" in result["hostProcess"]
+        # Never in an unrelated window; the window's extension-host pid routes a board here.
+        assert result["foreign"] == {"noHint": 409, "otherWindow": 409}
+        assert result["shownByHint"] == 200 and result["secondTab"]
+        # One tab per board, both live; showing the first board again reveals its tab.
+        assert result["viewers"]["panel-test"] >= 1 and result["viewers"]["panel-test-2"] >= 1
+        assert result["reshown"] == 200 and result["active"] == "How MCP works"
+        assert sorted(result["boardTabs"]) == ["Auth flow", "How MCP works"]
+        assert min(result["viewersAfter"].values()) >= 1
         assert result["browserTab"] and result["browser"]["attached"] >= 1
     finally:
         chat.release()

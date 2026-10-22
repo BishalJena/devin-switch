@@ -15,11 +15,13 @@ function whiteboardHome(configured) {
 
 class WhiteboardHost {
   /**
-   * @param {{ home: string, folders: () => string[], focused: () => boolean, onShow: (url: string, title: string) => Promise<void> | void,
+   * `hostId` names this window for the daemon, which routes a chat's board to the window whose id matches the chat's.
+   * @param {{ home: string, hostId: string, folders: () => string[], focused: () => boolean,
+   *           onShow: (board: { canvasId: string, url: string, title: string }) => Promise<void> | void,
    *           WebSocketImpl?: typeof WebSocket, fetchImpl?: typeof fetch, readFile?: (file: string) => Promise<string>, reconnectMs?: number }} options
    */
-  constructor({ home, folders, focused, onShow, WebSocketImpl = WebSocket, fetchImpl = fetch, readFile = (f) => fs.readFile(f, 'utf8'), reconnectMs = RECONNECT_MS }) {
-    Object.assign(this, { home, folders, focused, onShow, WebSocketImpl, fetchImpl, readFile, reconnectMs });
+  constructor({ home, hostId, folders, focused, onShow, WebSocketImpl = WebSocket, fetchImpl = fetch, readFile = (f) => fs.readFile(f, 'utf8'), reconnectMs = RECONNECT_MS }) {
+    Object.assign(this, { home, hostId, folders, focused, onShow, WebSocketImpl, fetchImpl, readFile, reconnectMs });
     this.socket = null;
     this.daemon = null;
     this.timer = null;
@@ -49,7 +51,7 @@ class WhiteboardHost {
     const socket = new this.WebSocketImpl(`${daemon.base.replace('http', 'ws')}/ws/host?token=${encodeURIComponent(daemon.token)}`);
     this.socket = socket;
     this.daemon = daemon;
-    socket.addEventListener('open', () => this.send({ t: 'hello', folders: this.folders(), focused: this.focused() }));
+    socket.addEventListener('open', () => this.send({ t: 'hello', hostId: this.hostId, folders: this.folders(), focused: this.focused() }));
     socket.addEventListener('message', (event) => void this.receive(event.data));
     socket.addEventListener('close', () => {
       if (this.socket !== socket) return;
@@ -85,7 +87,7 @@ class WhiteboardHost {
     }
     if (message.t !== 'show' || typeof message.reqId !== 'string' || typeof message.canvasId !== 'string' || !this.daemon) return;
     try {
-      await this.onShow(this.viewerUrl(message.canvasId), String(message.title ?? ''));
+      await this.onShow({ canvasId: message.canvasId, url: this.viewerUrl(message.canvasId), title: String(message.title ?? '') });
       this.send({ t: 'shown', reqId: message.reqId, ok: true });
     } catch (error) {
       this.send({ t: 'shown', reqId: message.reqId, ok: false, error: String(error?.message ?? error) });
