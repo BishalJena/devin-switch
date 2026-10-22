@@ -1,4 +1,4 @@
-"""Desktop side panels: the live Excalidraw canvas and the agent browser, beside the chat."""
+"""Desktop side panels: the live whiteboard and the agent browser, beside the chat."""
 
 import json
 import os
@@ -17,7 +17,7 @@ from devin_switch.store import Store, SwitchError, private_directory, write_json
 PUBLISHER = "devin-switch"
 NAME = "panels"
 EXTENSION_ID = f"{PUBLISHER}.{NAME}"
-OPEN_ENVIRONMENT = "EXCALIDRAW_LIVE_OPEN"
+OPEN_ENVIRONMENT = "WHITEBOARD_OPEN"
 
 
 def extensions_directory() -> Path:
@@ -37,7 +37,7 @@ def installed_version() -> str | None:
 
 
 def opener_command() -> str:
-    """The `{url}` template the Excalidraw MCP runs to show a canvas."""
+    """The `{url}` template the whiteboard MCP runs to show a canvas."""
     return f"{shlex.join([*command_prefix(), 'canvas', 'show'])} {{url}}"
 
 
@@ -161,7 +161,7 @@ def install(store: Store) -> str:
     return "\n".join(
         (
             f"Installed the Switch panels {version} into the Desktop app.",
-            "Commands: 'Switch: Open Excalidraw Canvas' and 'Switch: Open Agent Browser'.",
+            "Commands: 'Switch: Open Whiteboard' and 'Switch: Open Agent Browser'.",
             "Canvases from GUI chats now open beside the chat; terminal chats keep the browser.",
             "If the commands are missing, run 'Developer: Reload Window' once.",
         )

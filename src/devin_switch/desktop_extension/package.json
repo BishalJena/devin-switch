@@ -1,7 +1,7 @@
 {
   "name": "panels",
   "displayName": "Switch Panels",
-  "description": "Live Excalidraw canvas and agent browser beside the chat.",
+  "description": "Live whiteboard and agent browser beside the chat.",
   "version": "0.1.0",
   "publisher": "devin-switch",
   "license": "Apache-2.0",
@@ -11,15 +11,15 @@
   "activationEvents": ["onStartupFinished", "onUri"],
   "contributes": {
     "commands": [
-      { "command": "switchPanels.openCanvas", "title": "Open Excalidraw Canvas", "category": "Switch" },
+      { "command": "switchPanels.openCanvas", "title": "Open Whiteboard", "category": "Switch" },
       { "command": "switchPanels.openBrowser", "title": "Open Agent Browser", "category": "Switch" }
     ],
     "configuration": {
       "title": "Switch Panels",
       "properties": {
-        "switchPanels.excalidrawCommand": {
+        "switchPanels.whiteboardCommand": {
           "type": "string",
-          "default": "excalidraw-live",
+          "default": "whiteboard-mcp",
           "description": "Command that prints the workspace board URL with `<command> url`."
         }
       }

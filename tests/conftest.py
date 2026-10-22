@@ -57,7 +57,7 @@ def isolated_cli_state(store: Store, monkeypatch: pytest.MonkeyPatch, tmp_path: 
         "DS_ACP_RUN_ID",
         "DS_EXECUTABLE",
         "DS_FROZEN",
-        "EXCALIDRAW_LIVE_OPEN",
+        "WHITEBOARD_OPEN",
     ):
         monkeypatch.delenv(name, raising=False)
     # No inherited authentication should reach any fixture subprocess.

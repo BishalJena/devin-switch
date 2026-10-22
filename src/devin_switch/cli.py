@@ -109,14 +109,14 @@ def parser() -> argparse.ArgumentParser:
     stop.add_argument("profile", nargs="?")
     actions.add_parser("mcp", help="Serve the browser MCP server over stdio (started by Devin)")
     actions.add_parser("view", help="Serve the Desktop browser panel over stdio (JSON lines)")
-    canvas = commands.add_parser("canvas", help="Show live Excalidraw canvases")
+    canvas = commands.add_parser("canvas", help="Show live whiteboards")
     canvas_actions = canvas.add_subparsers(dest="action", required=True, metavar="ACTION")
     show = canvas_actions.add_parser(
         "show", help="Open a local canvas URL beside the Desktop chat, else in the browser"
     )
     show.add_argument("url")
     side = commands.add_parser(
-        "panels", help="Install the Desktop side panels (Excalidraw canvas, agent browser)"
+        "panels", help="Install the Desktop side panels (whiteboard, agent browser)"
     )
     side_actions = side.add_subparsers(dest="action", required=True, metavar="ACTION")
     side_actions.add_parser("install", help="Install or update the panels extension")

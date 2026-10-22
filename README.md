@@ -307,13 +307,14 @@ immediately. The server runs `npx -y chrome-devtools-mcp@1.10.1`, so Node.js is 
   and you can click, type, paste, scroll, navigate, open tabs or pick another Chrome profile.
   While the panel is open it holds the browser like a chat does, so Chrome stays open after
   the agent is done; closing the panel releases it.
-- **Canvas** shows a live Excalidraw board from an Excalidraw MCP server such as
-  `excalidraw-live`. When an agent in a Desktop chat opens a canvas, it appears beside that
-  chat in the window showing the chat's folder. Terminal chats, or Desktop without the panels,
-  keep opening the browser. `Switch: Open Excalidraw Canvas` opens the workspace board itself
-  (setting `switchPanels.excalidrawCommand`, default `excalidraw-live`).
+- **Canvas** shows a live whiteboard from
+  [whiteboard-mcp](https://github.com/ansuman-shukla/whiteboard-mcp). When an agent in a
+  Desktop chat opens a canvas, it appears beside that chat in the window showing the chat's
+  folder. Terminal chats, or Desktop without the panels,
+  keep opening the browser. `Switch: Open Whiteboard` opens the workspace board itself
+  (setting `switchPanels.whiteboardCommand`, default `whiteboard-mcp`).
 
-Switch gives every chat `EXCALIDRAW_LIVE_OPEN="ds canvas show {url}"` unless you set that
+Switch gives every chat `WHITEBOARD_OPEN="ds canvas show {url}"` unless you set that
 variable yourself. `ds panels status` shows the installed version.
 
 ### Switch accounts inside Devin Desktop (experimental)

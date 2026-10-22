@@ -104,7 +104,7 @@ function canvasHtml(webview, url) {
 </head><body><iframe src="${url.replace(/"/g, '&quot;')}" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads" allow="clipboard-read; clipboard-write"></iframe></body></html>`;
 }
 
-/** Adds the panel theme and embed flags to a canvas URL from the Excalidraw MCP. */
+/** Adds the panel theme and embed flags to a canvas URL from the whiteboard MCP. */
 function embedUrl(raw) {
   const url = new URL(raw);
   if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(url.hostname)) throw new Error('Only local canvas URLs can be shown.');
@@ -246,9 +246,9 @@ function workspaceFolder() {
 }
 
 async function openWorkspaceCanvas() {
-  const command = vscode.workspace.getConfiguration('switchPanels').get('excalidrawCommand') || 'excalidraw-live';
+  const command = vscode.workspace.getConfiguration('switchPanels').get('whiteboardCommand') || 'whiteboard-mcp';
   const folder = workspaceFolder();
-  const env = { ...process.env, EXCALIDRAW_LIVE_OPEN: 'none', ...(folder ? { EXCALIDRAW_LIVE_WORKSPACE: folder.uri.fsPath } : {}) };
+  const env = { ...process.env, WHITEBOARD_OPEN: 'none', ...(folder ? { WHITEBOARD_WORKSPACE: folder.uri.fsPath } : {}) };
   const url = await new Promise((resolve, reject) => {
     execFile(command, ['url'], { env, timeout: 20_000, cwd: folder?.uri.fsPath }, (error, stdout, stderr) => {
       if (error) reject(new Error(`${command} url failed: ${(stderr || error.message).trim()}`));
