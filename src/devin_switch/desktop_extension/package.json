@@ -1,0 +1,28 @@
+{
+  "name": "panels",
+  "displayName": "Switch Panels",
+  "description": "Live Excalidraw canvas and agent browser beside the chat.",
+  "version": "0.1.0",
+  "publisher": "devin-switch",
+  "license": "Apache-2.0",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other"],
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished", "onUri"],
+  "contributes": {
+    "commands": [
+      { "command": "switchPanels.openCanvas", "title": "Open Excalidraw Canvas", "category": "Switch" },
+      { "command": "switchPanels.openBrowser", "title": "Open Agent Browser", "category": "Switch" }
+    ],
+    "configuration": {
+      "title": "Switch Panels",
+      "properties": {
+        "switchPanels.excalidrawCommand": {
+          "type": "string",
+          "default": "excalidraw-live",
+          "description": "Command that prints the workspace board URL with `<command> url`."
+        }
+      }
+    }
+  }
+}
