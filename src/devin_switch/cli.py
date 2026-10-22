@@ -115,6 +115,12 @@ def parser() -> argparse.ArgumentParser:
         "show", help="Open a local canvas URL beside the Desktop chat, else in the browser"
     )
     show.add_argument("url")
+    side = commands.add_parser(
+        "panels", help="Install the Desktop side panels (Excalidraw canvas, agent browser)"
+    )
+    side_actions = side.add_subparsers(dest="action", required=True, metavar="ACTION")
+    side_actions.add_parser("install", help="Install or update the panels extension")
+    side_actions.add_parser("status", help="Show whether the panels extension is installed")
     supervise = actions.add_parser("_supervise")
     supervise.add_argument("profile")
     supervise.add_argument("--token", required=True)
@@ -166,7 +172,7 @@ def execute(args: argparse.Namespace, store: Store) -> int:
         from devin_switch import agent_browser
 
         return agent_browser.command(args, store)
-    if args.command == "canvas":
+    if args.command in ("canvas", "panels"):
         from devin_switch import panels
 
         return panels.command(args)
