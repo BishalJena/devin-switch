@@ -153,6 +153,14 @@ def target(store: Store, session_id: str | None, run_id: str | None) -> dict:
     return matches[0]
 
 
+def current_chat(store: Store) -> str:
+    """The conversation the calling process belongs to, from the GUI run that launched it."""
+    run_id = os.environ.get("DS_ACP_RUN_ID")
+    if not run_id:
+        raise SwitchError("Not inside a Desktop chat launched through Switch.")
+    return target(store, None, run_id)["session_id"]
+
+
 def read_request(path: Path) -> dict:
     try:
         request = json.loads(path.read_text())

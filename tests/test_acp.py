@@ -215,6 +215,22 @@ def test_gui_chats_and_handoffs_share_user_github_config(acp_native, tmp_path, m
     asyncio.run(scenario())
 
 
+def test_gui_chats_tell_the_whiteboard_their_conversation_across_handoffs(acp_native, tmp_path):
+    async def scenario():
+        async with connect(acp_native) as client:
+            first = await client.new(tmp_path)
+            second = await client.new(tmp_path)
+            await client.prompt(first, "whiteboard-chat")
+            await client.prompt(second, "whiteboard-chat")
+            await client.prompt(first, "/switch ansuman-2")
+            await client.prompt(first, "whiteboard-chat")
+        asked = [call for call in logged(acp_native) if call["chat_id"] is not None]
+        assert [call["chat_id"] for call in asked] == [first, second, first]
+        assert asked[0]["pid"] != asked[2]["pid"], "the handoff started a new native process"
+
+    asyncio.run(scenario())
+
+
 def test_gui_reopen_restores_account_and_replays_only_on_explicit_load(acp_native, tmp_path):
     async def scenario():
         async with connect(acp_native) as client:
