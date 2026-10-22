@@ -22,6 +22,7 @@ import urllib.request
 from pathlib import Path
 
 from devin_switch import browser, handoff
+from devin_switch.executable import command_prefix
 from devin_switch.native import user_config_home
 from devin_switch.store import (
     Account,
@@ -261,12 +262,6 @@ def stop(current: dict) -> None:
     deadline = time.monotonic() + 30
     while alive(current["supervisor"]) and time.monotonic() < deadline:
         time.sleep(0.1)
-
-
-def command_prefix() -> list[str]:
-    if getattr(sys, "frozen", False):
-        return [sys.executable]
-    return [sys.executable, "-m", "devin_switch.cli"]
 
 
 def chrome_command(data: Path, headed: bool) -> list[str]:
