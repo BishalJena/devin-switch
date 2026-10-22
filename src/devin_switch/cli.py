@@ -108,6 +108,7 @@ def parser() -> argparse.ArgumentParser:
     stop = actions.add_parser("stop", help="Close running agent browsers now")
     stop.add_argument("profile", nargs="?")
     actions.add_parser("mcp", help="Serve the browser MCP server over stdio (started by Devin)")
+    actions.add_parser("view", help="Serve the Desktop browser panel over stdio (JSON lines)")
     supervise = actions.add_parser("_supervise")
     supervise.add_argument("profile")
     supervise.add_argument("--token", required=True)

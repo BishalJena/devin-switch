@@ -335,3 +335,66 @@ def test_visible_mode_restarts_only_when_no_other_chat_uses_the_browser(
     assert "visible window" in text
     assert "--headless=new" not in launches(store, "Profile 3")[-1]
     first.close()
+
+
+class Viewer:
+    """The Desktop browser panel's helper process: `ds browser view`."""
+
+    def __init__(self, store: Store) -> None:
+        self.process = subprocess.Popen(
+            (sys.executable, "-m", "devin_switch.cli", "browser", "view"),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "DS_HOME": str(store.root)},
+        )
+        self.next_id = 0
+
+    def ask(self, op: str, **fields: object) -> dict:
+        assert self.process.stdin is not None and self.process.stdout is not None
+        self.next_id += 1
+        self.process.stdin.write(json.dumps({"id": self.next_id, "op": op, **fields}) + "\n")
+        self.process.stdin.flush()
+        reply = json.loads(self.process.stdout.readline())
+        assert reply["id"] == self.next_id
+        return reply
+
+    def close(self) -> None:
+        assert self.process.stdin is not None
+        self.process.stdin.close()
+        assert self.process.wait(timeout=15) == 0
+
+
+def test_desktop_viewer_keeps_the_watched_browser_alive_until_it_detaches_or_exits(
+    store: Store, fakes: None
+) -> None:
+    chat = Client(store)
+    chat.tool("browser_profile", profile="Profile 3")
+    viewer = Viewer(store)
+    rows = {row["directory"]: row for row in viewer.ask("profiles")["profiles"]}
+    port = rows["Profile 3"]["running"]["port"]
+    assert rows["Profile 3"]["running"]["headed"] is False
+    assert time.time() - rows["Profile 3"]["running"]["since"] < 60
+    assert rows["Profile 7"]["running"] is None and not rows["Profile 3"]["attached"]
+
+    attached = viewer.ask("attach", profile="ansuman@example.invalid")
+    assert attached["ok"] and attached["port"] == port and attached["profile"] == "Profile 3"
+    assert [r["attached"] for r in viewer.ask("profiles")["profiles"] if r["attached"]] == [True]
+    chat.close()
+    time.sleep(1)
+    assert agent_browser.running(store, "Profile 3"), "the panel's lease must keep Chrome alive"
+
+    assert viewer.ask("detach")["ok"]
+    wait_until(lambda: agent_browser.state(store, "Profile 3") is None)
+
+    started = viewer.ask("attach", profile="Profile 7")
+    assert started["ok"] and len(launches(store, "Profile 7")) == 1
+    assert viewer.ask("attach", profile="nobody@example.invalid") == {
+        "id": viewer.next_id,
+        "ok": False,
+        "error": "No Chrome profile matches 'nobody@example.invalid'. List them with: "
+        "ds browser status",
+    }
+    assert viewer.ask("bogus")["error"] == "Unknown request 'bogus'."
+    viewer.close()
+    wait_until(lambda: agent_browser.state(store, "Profile 7") is None)
