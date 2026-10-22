@@ -167,7 +167,11 @@ class Handler(BaseHTTPRequestHandler):
         body = self.read_body()
         if body is None:
             return self.refuse(400)
-        if relay.issued.key not in self.headers.get("Authorization", ""):
+        # Only the native knows the issued key; some calls (analytics) carry it only in the body.
+        if (
+            relay.issued.key not in self.headers.get("Authorization", "")
+            and relay.issued.key.encode() not in body
+        ):
             return self.refuse(403)
         tried = set()
         login = relay.active

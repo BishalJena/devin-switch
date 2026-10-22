@@ -148,6 +148,16 @@ def test_requests_without_the_issued_key_are_refused(upstream, started):
     assert not upstream.requests
 
 
+def test_requests_carrying_the_issued_key_only_in_the_body_are_forwarded(upstream, started):
+    proxy = started(make_login(upstream, "ansuman-1"), Rotations(upstream, []))
+    port = urlsplit(proxy.url).port
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    analytics = "/exa.product_analytics_pb.ProductAnalyticsService/BatchRecordAnalyticsEvents"
+    connection.request("POST", analytics, body=b"events:" + proxy.issued.key.encode())
+    assert connection.getresponse().read() == b"status None"
+    assert upstream.requests[-1]["body"] == "ansuman-1"
+
+
 @pytest.mark.parametrize("mismatch", ["key-length", "server"])
 def test_incompatible_replacement_logins_are_not_used(upstream, started, mismatch):
     upstream.exhausted = {"ansuman-1"}
