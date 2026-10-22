@@ -6,6 +6,7 @@ const { readFileSync } = require('node:fs');
 const path = require('node:path');
 const { Cdp } = require('./cdp');
 const { BrowserView } = require('./browser');
+const { CanvasPanels } = require('./canvas');
 const { WhiteboardHost, whiteboardHome } = require('./whiteboard');
 
 const STATUS_POLL_MS = 5000;
@@ -93,59 +94,6 @@ class Helper {
 
 function nonce() {
   return randomBytes(16).toString('base64');
-}
-
-function canvasHtml(webview, url) {
-  const n = nonce();
-  return `<!doctype html><html><head><meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src http://127.0.0.1:* http://localhost:*; style-src 'nonce-${n}';">
-<style nonce="${n}">html,body,iframe{margin:0;padding:0;border:0;width:100%;height:100%;overflow:hidden;display:block}</style>
-</head><body><iframe src="${url.replace(/"/g, '&quot;')}" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads" allow="clipboard-read; clipboard-write"></iframe></body></html>`;
-}
-
-/** Adds the panel theme and embed flags to a board URL from the whiteboard daemon. */
-function embedUrl(raw) {
-  const url = new URL(raw);
-  if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(url.hostname)) throw new Error('Only local canvas URLs can be shown.');
-  url.searchParams.set('embed', '1');
-  const kind = vscode.window.activeColorTheme.kind;
-  url.searchParams.set('theme', kind === vscode.ColorThemeKind.Light || kind === vscode.ColorThemeKind.HighContrastLight ? 'light' : 'dark');
-  return url.toString();
-}
-
-class CanvasPanel {
-  static current = null;
-
-  static show(url, title = '') {
-    const src = embedUrl(url);
-    const label = title || 'Whiteboard';
-    if (CanvasPanel.current) {
-      CanvasPanel.current.panel.title = label;
-      CanvasPanel.current.panel.reveal(vscode.ViewColumn.Beside, true);
-      if (CanvasPanel.current.src !== src) CanvasPanel.current.load(src);
-      return;
-    }
-    const panel = vscode.window.createWebviewPanel('switchPanels.canvas', label, { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true }, {
-      enableScripts: true,
-      retainContextWhenHidden: true,
-    });
-    CanvasPanel.current = new CanvasPanel(panel);
-    CanvasPanel.current.load(src);
-  }
-
-  constructor(panel) {
-    this.panel = panel;
-    this.src = '';
-    panel.iconPath = new vscode.ThemeIcon('edit');
-    panel.onDidDispose(() => {
-      if (CanvasPanel.current === this) CanvasPanel.current = null;
-    });
-  }
-
-  load(src) {
-    this.src = src;
-    this.panel.webview.html = canvasHtml(this.panel.webview, src);
-  }
 }
 
 class BrowserPanel {
@@ -241,13 +189,13 @@ class BrowserPanel {
   }
 }
 
-async function pickBoard(host) {
+async function pickBoard(host, canvases) {
   const boards = await host.boards();
   if (!boards.length) return void vscode.window.showInformationMessage('No whiteboards in this workspace yet. Ask the agent to explain something visually.');
   const untitled = (b) => !b.title || b.title === b.id;
   const items = boards.map((b) => ({ label: untitled(b) ? 'Untitled board' : b.title, description: `${b.elementCount} elements`, detail: new Date(b.updatedAt).toLocaleString(), board: b }));
   const chosen = items.length === 1 ? items[0] : await vscode.window.showQuickPick(items, { placeHolder: 'Open a whiteboard from this workspace' });
-  if (chosen) CanvasPanel.show(host.viewerUrl(chosen.board.id), chosen.label);
+  if (chosen) canvases.show(chosen.board.id, host.viewerUrl(chosen.board.id), chosen.label);
 }
 
 function activate(context) {
@@ -279,6 +227,7 @@ function activate(context) {
   void poll();
 
   const report = (error) => vscode.window.showErrorMessage(error.message);
+  const canvases = new CanvasPanels(vscode);
   // The whiteboard daemon asks the window showing the chat's folder to open its board.
   const host = new WhiteboardHost({
     home: whiteboardHome(vscode.workspace.getConfiguration('switchPanels').get('whiteboardHome')),
@@ -286,7 +235,7 @@ function activate(context) {
     hostId: String(process.pid),
     folders: () => (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
     focused: () => vscode.window.state.focused,
-    onShow: ({ url, title }) => CanvasPanel.show(url, title),
+    onShow: ({ canvasId, url, title }) => canvases.show(canvasId, url, title),
   });
   host.start();
   context.subscriptions.push(
@@ -294,13 +243,14 @@ function activate(context) {
     { dispose: () => clearInterval(timer) },
     { dispose: () => helper.dispose() },
     { dispose: () => host.dispose() },
+    { dispose: () => canvases.dispose() },
     vscode.window.onDidChangeWindowState(() => host.update()),
     vscode.workspace.onDidChangeWorkspaceFolders(() => host.update()),
-    vscode.commands.registerCommand('switchPanels.openCanvas', () => pickBoard(host).catch(report)),
+    vscode.commands.registerCommand('switchPanels.openCanvas', () => pickBoard(host, canvases).catch(report)),
     vscode.commands.registerCommand('switchPanels.openBrowser', () => BrowserPanel.show(context, helper)),
   );
 }
 
 function deactivate() {}
 
-module.exports = { activate, deactivate, dsConfig, embedUrl };
+module.exports = { activate, deactivate, dsConfig };
