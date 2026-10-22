@@ -282,9 +282,11 @@ function activate(context) {
   // The whiteboard daemon asks the window showing the chat's folder to open its board.
   const host = new WhiteboardHost({
     home: whiteboardHome(vscode.workspace.getConfiguration('switchPanels').get('whiteboardHome')),
+    // This extension host started the window's chats, which pass its pid to whiteboard-mcp as WINDSURF_EXT_HOST_PID.
+    hostId: String(process.pid),
     folders: () => (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
     focused: () => vscode.window.state.focused,
-    onShow: (url, title) => CanvasPanel.show(url, title),
+    onShow: ({ url, title }) => CanvasPanel.show(url, title),
   });
   host.start();
   context.subscriptions.push(
