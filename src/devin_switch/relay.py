@@ -70,6 +70,11 @@ def login(store: Store, account: Account) -> Login | None:
     return Login(account, key, server.rstrip("/"))
 
 
+def compatible(issued: Login, replacement: Login) -> bool:
+    # A same-length key keeps the protobuf length prefixes around it valid.
+    return replacement.server == issued.server and len(replacement.key) == len(issued.key)
+
+
 def quota_frame(head: bytes, encoding: str | None) -> bool:
     """Whether a Connect stream starts with an end-of-stream error for exhausted usage."""
     if len(head) < 5 or not head[0] & END_STREAM:
@@ -127,12 +132,7 @@ class Relay:
             if len(tried) > ROTATION_LIMIT:
                 return None
             replacement = self.rotate(current, tried)
-            # A same-length key keeps the protobuf length prefixes around it valid.
-            if (
-                replacement is None
-                or replacement.server != self.issued.server
-                or len(replacement.key) != len(self.issued.key)
-            ):
+            if replacement is None or not compatible(self.issued, replacement):
                 return None
             self.active = replacement
             return replacement

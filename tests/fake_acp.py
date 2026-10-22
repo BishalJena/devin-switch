@@ -249,6 +249,9 @@ async def handle(message):
                 if spawned:
                     # The parent reads its subagents and answers in a later inference.
                     upstream = await asyncio.to_thread(infer)
+            except (TypeError, OSError, RuntimeError):
+                emit({"id": message["id"], "error": {"code": -32603, "message": "No API login"}})
+                return
             except QuotaExhausted as exc:
                 data = {
                     "cognition.ai/errorKind": "resource_exhausted",
