@@ -124,7 +124,7 @@ def test_vsix_holds_every_extension_file_a_valid_manifest_and_this_ds(tmp_path: 
     import xml.etree.ElementTree as ET
     import zipfile
 
-    vsix = panels.build_vsix(tmp_path, Path("/state/ds"))
+    vsix = panels.build_vsix(tmp_path)
     with zipfile.ZipFile(vsix) as archive:
         names = set(archive.namelist())
         package = json.loads(archive.read("extension/package.json"))
@@ -144,19 +144,19 @@ def test_vsix_holds_every_extension_file_a_valid_manifest_and_this_ds(tmp_path: 
         "Publisher": package["publisher"],
     }
     assert f"{package['publisher']}.{package['name']}" == panels.EXTENSION_ID
-    assert ds == {"command": [sys.executable, "-m", "devin_switch.cli"], "home": "/state/ds"}
+    assert ds == {"command": [sys.executable, "-m", "devin_switch.cli"]}
     assert vsix.name == f"{panels.EXTENSION_ID}-{package['version']}.vsix"
 
 
 def test_install_and_status_report_the_desktop_extension(desktop_cli: Path, store) -> None:
     version = panels.manifest()["version"]
     assert "not installed" in panels.status()
-    assert f"Installed the Switch panels {version}" in panels.install(store)
+    assert f"Installed the Switch panels {version}" in panels.install()
     assert panels.installed_version() == version
     assert panels.status() == f"Switch panels {version} are installed in the Desktop app."
     installed = panels.extensions_directory() / f"{panels.EXTENSION_ID}-{version}"
     ds = json.loads((installed / "ds.json").read_text())
-    assert ds["command"][0] == sys.executable and ds["home"] == str(store.root)
+    assert ds["command"][0] == sys.executable
     install_extension("0.0.1")
     assert "is available, run: ds panels install" in panels.status()
 
@@ -164,20 +164,20 @@ def test_install_and_status_report_the_desktop_extension(desktop_cli: Path, stor
 def test_install_surfaces_desktop_failures(desktop_cli: Path, monkeypatch, store) -> None:
     monkeypatch.setenv("FAKE_DESKTOP_FAIL", "1")
     with pytest.raises(SwitchError, match="boom: corrupt package"):
-        panels.install(store)
+        panels.install()
     monkeypatch.delenv("FAKE_DESKTOP_FAIL")
     monkeypatch.setenv("FAKE_DESKTOP_FORGET", "1")
     with pytest.raises(SwitchError, match="did not record"):
-        panels.install(store)
+        panels.install()
     monkeypatch.setenv("DS_DESKTOP_CLI", "/nonexistent/devin-desktop")
     with pytest.raises(SwitchError, match="command line tool is missing"):
-        panels.install(store)
+        panels.install()
 
 
 @pytest.mark.skipif(not panels.DESKTOP_CLI.exists(), reason="The Desktop app is not installed")
 def test_real_desktop_cli_accepts_the_vsix_in_an_isolated_extensions_dir(tmp_path: Path) -> None:
     extensions, user_data = tmp_path / "extensions", tmp_path / "user-data"
-    vsix = panels.build_vsix(tmp_path, tmp_path / "state")
+    vsix = panels.build_vsix(tmp_path)
     environment = {
         k: v for k, v in os.environ.items() if not k.startswith(("VSCODE_", "ELECTRON_"))
     }

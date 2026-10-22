@@ -172,7 +172,7 @@ def execute(args: argparse.Namespace, store: Store) -> int:
     if args.command == "panels":
         from devin_switch import panels
 
-        return panels.command(args, store)
+        return panels.command(args)
     if args.command == "chat":
         from devin_switch import acp_state
 

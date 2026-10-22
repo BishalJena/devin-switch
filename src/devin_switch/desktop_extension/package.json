@@ -8,7 +8,7 @@
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Other"],
   "main": "./extension.js",
-  "activationEvents": ["onStartupFinished", "onUri"],
+  "activationEvents": ["onStartupFinished"],
   "contributes": {
     "commands": [
       { "command": "switchPanels.openCanvas", "title": "Open Whiteboard", "category": "Switch" },
@@ -17,10 +17,10 @@
     "configuration": {
       "title": "Switch Panels",
       "properties": {
-        "switchPanels.whiteboardCommand": {
+        "switchPanels.whiteboardHome": {
           "type": "string",
-          "default": "whiteboard-mcp",
-          "description": "Command that prints the workspace board URL with `<command> url`."
+          "default": "",
+          "description": "whiteboard-mcp state folder (default: WHITEBOARD_HOME or ~/.whiteboard-mcp)."
         }
       }
     }

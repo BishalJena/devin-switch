@@ -9,7 +9,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from devin_switch.executable import command_prefix
-from devin_switch.store import Store, SwitchError
+from devin_switch.store import SwitchError
 
 PUBLISHER = "devin-switch"
 NAME = "panels"
@@ -72,7 +72,7 @@ Addressable="true"/>
 """
 
 
-def build_vsix(destination: Path, home: Path) -> Path:
+def build_vsix(destination: Path) -> Path:
     """Package the extension with this ds's command line so it never guesses a PATH."""
     package = manifest()
     vsix = destination / f"{EXTENSION_ID}-{package['version']}.vsix"
@@ -82,9 +82,7 @@ def build_vsix(destination: Path, home: Path) -> Path:
         for path in sorted(SOURCE.rglob("*")):
             if path.is_file() and "__pycache__" not in path.parts:
                 archive.write(path, f"extension/{path.relative_to(SOURCE).as_posix()}")
-        archive.writestr(
-            "extension/ds.json", json.dumps({"command": command_prefix(), "home": str(home)})
-        )
+        archive.writestr("extension/ds.json", json.dumps({"command": command_prefix()}))
     return vsix
 
 
@@ -95,10 +93,10 @@ def desktop_cli() -> Path:
     return cli
 
 
-def install(store: Store) -> str:
+def install() -> str:
     cli = desktop_cli()
     with tempfile.TemporaryDirectory(prefix="ds-panels-") as temporary:
-        vsix = build_vsix(Path(temporary), store.root)
+        vsix = build_vsix(Path(temporary))
         result = subprocess.run(
             (str(cli), "--install-extension", str(vsix), "--force"),
             capture_output=True,
@@ -131,9 +129,9 @@ def status() -> str:
     return f"Switch panels {current} are installed in the Desktop app{note}."
 
 
-def command(args, store: Store) -> int:
+def command(args) -> int:
     if args.action == "install":
-        print(install(store))
+        print(install())
     elif args.action == "status":
         print(status())
     return 0

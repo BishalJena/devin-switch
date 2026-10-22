@@ -1,26 +1,25 @@
 'use strict';
 const vscode = require('vscode');
-const { spawn, execFile } = require('node:child_process');
+const { spawn } = require('node:child_process');
 const { randomBytes } = require('node:crypto');
 const { readFileSync } = require('node:fs');
 const path = require('node:path');
 const { Cdp } = require('./cdp');
 const { BrowserView } = require('./browser');
-const { claim } = require('./requests');
+const { WhiteboardHost, whiteboardHome } = require('./whiteboard');
 
 const STATUS_POLL_MS = 5000;
-const REQUEST_POLL_MS = 400;
 const HELPER_TIMEOUT_MS = 90_000;
 
-/** `ds` argv and state folder recorded by `ds panels install`; falls back to `ds` on PATH. */
+/** `ds` argv recorded by `ds panels install`; falls back to `ds` on PATH. */
 function dsConfig(extensionPath) {
   try {
-    const { command, home } = JSON.parse(readFileSync(path.join(extensionPath, 'ds.json'), 'utf8'));
-    if (Array.isArray(command) && command.length) return { command, home: typeof home === 'string' ? home : null };
+    const { command } = JSON.parse(readFileSync(path.join(extensionPath, 'ds.json'), 'utf8'));
+    if (Array.isArray(command) && command.length) return { command };
   } catch {
     // not installed through ds
   }
-  return { command: ['ds'], home: null };
+  return { command: ['ds'] };
 }
 
 /** JSON-lines client for `ds browser view`; one per window, holding at most one lease. */
@@ -104,7 +103,7 @@ function canvasHtml(webview, url) {
 </head><body><iframe src="${url.replace(/"/g, '&quot;')}" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads" allow="clipboard-read; clipboard-write"></iframe></body></html>`;
 }
 
-/** Adds the panel theme and embed flags to a canvas URL from the whiteboard MCP. */
+/** Adds the panel theme and embed flags to a board URL from the whiteboard daemon. */
 function embedUrl(raw) {
   const url = new URL(raw);
   if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(url.hostname)) throw new Error('Only local canvas URLs can be shown.');
@@ -117,14 +116,16 @@ function embedUrl(raw) {
 class CanvasPanel {
   static current = null;
 
-  static show(url) {
+  static show(url, title = '') {
     const src = embedUrl(url);
+    const label = title || 'Whiteboard';
     if (CanvasPanel.current) {
+      CanvasPanel.current.panel.title = label;
       CanvasPanel.current.panel.reveal(vscode.ViewColumn.Beside, true);
       if (CanvasPanel.current.src !== src) CanvasPanel.current.load(src);
       return;
     }
-    const panel = vscode.window.createWebviewPanel('switchPanels.canvas', 'Canvas', { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true }, {
+    const panel = vscode.window.createWebviewPanel('switchPanels.canvas', label, { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true }, {
       enableScripts: true,
       retainContextWhenHidden: true,
     });
@@ -240,22 +241,13 @@ class BrowserPanel {
   }
 }
 
-function workspaceFolder() {
-  const active = vscode.window.activeTextEditor?.document.uri;
-  return (active && vscode.workspace.getWorkspaceFolder(active)) ?? vscode.workspace.workspaceFolders?.[0];
-}
-
-async function openWorkspaceCanvas() {
-  const command = vscode.workspace.getConfiguration('switchPanels').get('whiteboardCommand') || 'whiteboard-mcp';
-  const folder = workspaceFolder();
-  const env = { ...process.env, WHITEBOARD_OPEN: 'none', ...(folder ? { WHITEBOARD_WORKSPACE: folder.uri.fsPath } : {}) };
-  const url = await new Promise((resolve, reject) => {
-    execFile(command, ['url'], { env, timeout: 20_000, cwd: folder?.uri.fsPath }, (error, stdout, stderr) => {
-      if (error) reject(new Error(`${command} url failed: ${(stderr || error.message).trim()}`));
-      else resolve(stdout.trim().split('\n').pop());
-    });
-  });
-  CanvasPanel.show(url);
+async function pickBoard(host) {
+  const boards = await host.boards();
+  if (!boards.length) return void vscode.window.showInformationMessage('No whiteboards in this workspace yet. Ask the agent to explain something visually.');
+  const untitled = (b) => !b.title || b.title === b.id;
+  const items = boards.map((b) => ({ label: untitled(b) ? 'Untitled board' : b.title, description: `${b.elementCount} elements`, detail: new Date(b.updatedAt).toLocaleString(), board: b }));
+  const chosen = items.length === 1 ? items[0] : await vscode.window.showQuickPick(items, { placeHolder: 'Open a whiteboard from this workspace' });
+  if (chosen) CanvasPanel.show(host.viewerUrl(chosen.board.id), chosen.label);
 }
 
 function activate(context) {
@@ -287,37 +279,23 @@ function activate(context) {
   void poll();
 
   const report = (error) => vscode.window.showErrorMessage(error.message);
-  // Canvas requests from chats: the window showing the chat's folder opens it, without a URI prompt.
-  const requests = config.home && path.join(config.home, 'panels', 'requests');
-  const requestTimer = requests && setInterval(() => {
-    const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
-    for (const request of claim(requests, { folders, focused: vscode.window.state.focused })) {
-      try {
-        CanvasPanel.show(request.url);
-      } catch (error) {
-        report(error);
-      }
-    }
-  }, REQUEST_POLL_MS);
+  // The whiteboard daemon asks the window showing the chat's folder to open its board.
+  const host = new WhiteboardHost({
+    home: whiteboardHome(vscode.workspace.getConfiguration('switchPanels').get('whiteboardHome')),
+    folders: () => (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+    focused: () => vscode.window.state.focused,
+    onShow: (url, title) => CanvasPanel.show(url, title),
+  });
+  host.start();
   context.subscriptions.push(
     status,
     { dispose: () => clearInterval(timer) },
-    { dispose: () => requestTimer && clearInterval(requestTimer) },
     { dispose: () => helper.dispose() },
-    vscode.commands.registerCommand('switchPanels.openCanvas', (url) => (typeof url === 'string' ? Promise.resolve(CanvasPanel.show(url)) : openWorkspaceCanvas()).catch(report)),
+    { dispose: () => host.dispose() },
+    vscode.window.onDidChangeWindowState(() => host.update()),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => host.update()),
+    vscode.commands.registerCommand('switchPanels.openCanvas', () => pickBoard(host).catch(report)),
     vscode.commands.registerCommand('switchPanels.openBrowser', () => BrowserPanel.show(context, helper)),
-    vscode.window.registerUriHandler({
-      handleUri(uri) {
-        if (uri.path === '/canvas') {
-          const url = new URLSearchParams(uri.query).get('url');
-          try {
-            if (url) CanvasPanel.show(url);
-          } catch (error) {
-            report(error);
-          }
-        } else if (uri.path === '/browser') BrowserPanel.show(context, helper);
-      },
-    }),
   );
 }
 

@@ -35,16 +35,28 @@ async function attachedPages() {
   return { pages: list.filter((t) => t.type === 'page').length, attached: reply.result.targetInfos.filter((t) => t.type === 'page' && t.attached).length };
 }
 
+async function whiteboard(method, route, body) {
+  const res = await fetch(`${env.PANELS_WB_URL}${route}`, {
+    method,
+    headers: { Authorization: `Bearer ${env.PANELS_WB_TOKEN}`, 'Content-Type': 'application/json' },
+    body: body && JSON.stringify(body),
+  });
+  return { status: res.status, body: await res.json() };
+}
+
 exports.run = async () => {
   const results = {};
   try {
     await vscode.extensions.getExtension('devin-switch.panels').activate();
-    const requests = path.join(env.DS_HOME, 'panels', 'requests');
-    fs.mkdirSync(requests, { recursive: true });
-    const request = path.join(requests, `1-test.json`);
-    fs.writeFileSync(request, JSON.stringify({ url: env.PANELS_CANVAS_URL, cwd: vscode.workspace.workspaceFolders[0].uri.fsPath, at: Date.now() }));
-    results.claimed = await waitFor('the request to be claimed', () => !fs.existsSync(request), 10_000);
-    results.canvasTab = await waitFor('the Canvas tab', () => tabLabels().includes('Canvas'));
+    const workspace = vscode.workspace.workspaceFolders[0].uri.fsPath;
+    await whiteboard('PUT', '/api/canvases/panel-test', { title: 'How MCP works', workspace, chat: 'chat-1' });
+    // The extension connects to the daemon as a panel host within a few seconds.
+    results.shown = await waitFor('the daemon to reach the panel host', async () => (await whiteboard('POST', '/api/canvases/panel-test/show', { workspace })).status === 200);
+    results.canvasTab = await waitFor('the board tab titled after the topic', () => tabLabels().includes('How MCP works'));
+    results.viewers = await waitFor('the embedded viewer to connect live', async () => {
+      const { body } = await whiteboard('GET', '/api/canvases');
+      return body.find((b) => b.id === 'panel-test')?.viewers || 0;
+    });
 
     await vscode.commands.executeCommand('switchPanels.openBrowser');
     results.browserTab = await waitFor('the Agent Browser tab', () => tabLabels().includes('Agent Browser'));
@@ -53,7 +65,7 @@ exports.run = async () => {
       return state.attached > 0 && state;
     });
   } catch (error) {
-    results.error = String(error && error.stack || error);
+    results.error = String((error && error.stack) || error);
   }
   fs.writeFileSync(env.PANELS_RESULT, JSON.stringify(results));
 };
