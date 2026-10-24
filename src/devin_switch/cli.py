@@ -92,6 +92,36 @@ def parser() -> argparse.ArgumentParser:
     )
     verify.add_argument("first")
     verify.add_argument("second")
+    agent = commands.add_parser(
+        "browser", help="Manage the agent-owned Chrome behind the browser MCP server"
+    )
+    actions = agent.add_subparsers(dest="action", required=True, metavar="ACTION")
+    install = actions.add_parser(
+        "install", help="Register the browser MCP server for every chat and allow its tools"
+    )
+    install.add_argument("--default", help="Profile for chats that name none: email or directory")
+    default = actions.add_parser("default", help="Set the profile for chats that name none")
+    default.add_argument("profile")
+    actions.add_parser("status", help="List Chrome profiles and running agent browsers")
+    refresh = actions.add_parser("refresh", help="Copy a Chrome profile's logins again")
+    refresh.add_argument("profile")
+    stop = actions.add_parser("stop", help="Close running agent browsers now")
+    stop.add_argument("profile", nargs="?")
+    actions.add_parser("mcp", help="Serve the browser MCP server over stdio (started by Devin)")
+    actions.add_parser("view", help="Serve the Desktop browser panel over stdio (JSON lines)")
+    chat = commands.add_parser("chat", help="Inspect the Desktop chat this process belongs to")
+    chat_actions = chat.add_subparsers(dest="action", required=True, metavar="ACTION")
+    chat_actions.add_parser("id", help="Print the conversation id (used by the whiteboard MCP)")
+    side = commands.add_parser(
+        "panels", help="Install the Desktop side panels (whiteboard, agent browser)"
+    )
+    side_actions = side.add_subparsers(dest="action", required=True, metavar="ACTION")
+    side_actions.add_parser("install", help="Install or update the panels extension")
+    side_actions.add_parser("status", help="Show whether the panels extension is installed")
+    supervise = actions.add_parser("_supervise")
+    supervise.add_argument("profile")
+    supervise.add_argument("--token", required=True)
+    supervise.add_argument("--headed", action="store_true")
     return root
 
 
@@ -135,6 +165,19 @@ def verify(native: Native, first: Account, second: Account) -> None:
 
 
 def execute(args: argparse.Namespace, store: Store) -> int:
+    if args.command == "browser":
+        from devin_switch import agent_browser
+
+        return agent_browser.command(args, store)
+    if args.command == "panels":
+        from devin_switch import panels
+
+        return panels.command(args)
+    if args.command == "chat":
+        from devin_switch import acp_state
+
+        print(acp_state.current_chat(store))
+        return 0
     if args.command == "acp":
         import asyncio
 
@@ -292,6 +335,10 @@ def execute(args: argparse.Namespace, store: Store) -> int:
             }:
                 raise SwitchError("Unknown Chrome profile. Run: ds profiles")
             account = store.add(args.account, args.chrome_profile)
+            from devin_switch import agent_browser
+
+            if agent_browser.installed(store):
+                agent_browser.grant(store, account)
             print(f"Added {account.name}. Sign in once: ds login {account.name}")
             return 0
         if args.command == "list":

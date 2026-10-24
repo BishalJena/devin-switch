@@ -1,9 +1,11 @@
 import asyncio
 import json
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -22,10 +24,74 @@ connection.execute(
 )
 connection.commit()
 settings = {"mode": "ask", "model": "test-model"}
+cold = False
+if account == os.environ.get("FAKE_COLD_CATALOG_ACCOUNT"):
+    counter = Path(os.environ["FAKE_COLD_CATALOG_STARTS"])
+    remaining = int(counter.read_text())
+    cold = remaining != 0
+    if remaining > 0:
+        counter.write_text(str(remaining - 1))
 replies = {}
 loaded = None
 project = None
+host = None
 canceled = asyncio.Event()
+INFERENCE = "/exa.api_server_pb.ApiServerService/GetChatMessage"
+STATUS = "/exa.seat_management_pb.SeatManagementService/GetUserStatus"
+
+
+class QuotaExhausted(Exception):
+    pass
+
+
+def call_api(path):
+    # Like the native, send the host-issued key in both the header and the protobuf body.
+    request = urllib.request.Request(
+        host["url"] + path,
+        data=b"\x0a" + bytes([len(host["key"])]) + host["key"].encode() + b"\x12\x02hi",
+        headers={"Authorization": f"Basic {host['key']}-sk", "Content-Type": "application/proto"},
+    )
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request) as response:
+        return response.read()
+
+
+def infer():
+    data = call_api(INFERENCE)
+    if data[0] & 2:
+        error = json.loads(data[5:]).get("error", {})
+        if "usage quota has been exhausted" in error.get("message", ""):
+            raise QuotaExhausted(error["message"])
+        raise RuntimeError(error.get("code"))
+    return data[5 : 5 + int.from_bytes(data[1:5], "big")].decode()
+
+
+def subagent_update(session_id, key, value):
+    update(
+        session_id,
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "spawn-" + value["agentId"],
+            "status": "completed" if value.get("success", True) else "failed",
+            "_meta": {key: value},
+        },
+    )
+
+
+async def subagent(session_id, agent_id):
+    subagent_update(session_id, "cognition.ai/subagent_started", {"agentId": agent_id})
+    gate = Path(os.environ["FAKE_SUBAGENT_GATE"])
+    while not gate.exists():
+        await asyncio.sleep(0.02)
+    try:
+        summary, success = await asyncio.to_thread(infer), True
+    except QuotaExhausted as exc:
+        summary, success = f"[Error] {exc}", False
+    subagent_update(
+        session_id,
+        "cognition.ai/subagent_completed",
+        {"agentId": agent_id, "success": success, "summary": summary},
+    )
+    return agent_id, summary
 
 
 def emit(message):
@@ -39,8 +105,11 @@ def configs():
             "name": key,
             "category": key,
             "type": "select",
-            "currentValue": value,
-            "options": [{"value": value, "name": value}],
+            **(
+                {"currentValue": "fallback-model", "options": []}
+                if cold and key == "model"
+                else {"currentValue": value, "options": [{"value": value, "name": value}]}
+            ),
         }
         for key, value in settings.items()
     ]
@@ -50,8 +119,17 @@ def update(session_id, change):
     emit({"method": "session/update", "params": {"sessionId": session_id, "update": change}})
 
 
+def whiteboard_chat(params):
+    """Runs the chat-id command an MCP server would get, only when a test asks for it."""
+    if (params.get("prompt") or [{}])[0].get("text") != "whiteboard-chat":
+        return None
+    command = shlex.split(os.environ["WHITEBOARD_CHAT_COMMAND"])
+    done = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    return done.stdout.strip() if done.returncode == 0 else f"error: {done.stderr.strip()}"
+
+
 async def handle(message):
-    global loaded, project
+    global loaded, project, host
     method, params = message["method"], message.get("params", {})
     if path := os.environ.get("FAKE_ACP_LOG"):
         with open(path, "a") as handle:
@@ -65,6 +143,7 @@ async def handle(message):
                         "args": sys.argv[1:],
                         "gh_config_dir": os.environ.get("GH_CONFIG_DIR"),
                         "text": (params.get("prompt") or [{}])[0].get("text"),
+                        "chat_id": whiteboard_chat(params),
                     }
                 )
                 + "\n"
@@ -80,6 +159,20 @@ async def handle(message):
             "authMethods": [{"id": "api-key", "name": "API key"}],
             "agentInfo": {"name": "fake", "version": "1"},
         }
+    elif method == "authenticate" and params.get("methodId") == "windsurf-api-key":
+        previous, host = (
+            host,
+            {
+                "key": params["_meta"]["api_key"],
+                "url": params["_meta"]["api_server_url"],
+            },
+        )
+        try:
+            await asyncio.to_thread(call_api, STATUS)
+        except OSError:
+            host = previous
+            emit({"id": message["id"], "error": {"code": -32603, "message": "Auth failed"}})
+            return
     elif method in {"session/new", "session/load"}:
         if expected := os.environ.get("FAKE_EXPECT_CONTEXT"):
             for key, value in json.loads(expected).items():
@@ -156,6 +249,44 @@ async def handle(message):
                 }
             )
             return
+        if text in {"infer", "subagents"}:
+            try:
+                upstream = await asyncio.to_thread(infer)
+                spawned = (
+                    dict(await asyncio.gather(subagent(loaded, "s1"), subagent(loaded, "s2")))
+                    if text == "subagents"
+                    else None
+                )
+                if spawned:
+                    # The parent reads its subagents and answers in a later inference.
+                    upstream = await asyncio.to_thread(infer)
+            except (TypeError, OSError, RuntimeError):
+                emit({"id": message["id"], "error": {"code": -32603, "message": "No API login"}})
+                return
+            except QuotaExhausted as exc:
+                data = {
+                    "cognition.ai/errorKind": "resource_exhausted",
+                    "cognition.ai/retryable": True,
+                }
+                emit(
+                    {
+                        "id": message["id"],
+                        "error": {"code": -32011, "message": str(exc), "data": data},
+                    }
+                )
+                return
+            reply = {"account": account, "session": loaded, "upstream": upstream}
+            if spawned:
+                reply["subagents"] = spawned
+            update(
+                loaded,
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": json.dumps(reply)},
+                },
+            )
+            emit({"id": message["id"], "result": {"stopReason": "end_turn"}})
+            return
         if text == "slow":
             await asyncio.sleep(0.5)
         if text == "wait":
@@ -216,6 +347,18 @@ async def handle(message):
     elif method == "session/cancel":
         canceled.set()
     elif method == "session/set_config_option":
+        if cold and params["configId"] == "model":
+            emit(
+                {
+                    "id": message["id"],
+                    "error": {
+                        "code": -32002,
+                        "message": "Resource not found",
+                        "data": {"uri": f"Model not found: {params['value']}. Available models: "},
+                    },
+                }
+            )
+            return
         if os.environ.get("FAKE_IGNORE_CONFIG_ACCOUNT") != account:
             settings[params["configId"]] = params["value"]
         result = {"configOptions": configs()}

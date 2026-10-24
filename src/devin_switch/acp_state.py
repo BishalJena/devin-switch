@@ -153,6 +153,14 @@ def target(store: Store, session_id: str | None, run_id: str | None) -> dict:
     return matches[0]
 
 
+def current_chat(store: Store) -> str:
+    """The conversation the calling process belongs to, from the GUI run that launched it."""
+    run_id = os.environ.get("DS_ACP_RUN_ID")
+    if not run_id:
+        raise SwitchError("Not inside a Desktop chat launched through Switch.")
+    return target(store, None, run_id)["session_id"]
+
+
 def read_request(path: Path) -> dict:
     try:
         request = json.loads(path.read_text())
@@ -253,6 +261,14 @@ class Lease:
             if blocker := sessions.resume_blocker({"id": session_id}, others):
                 raise SwitchError(blocker)
             self.run = replace(self.run, session_id=session_id)
+            write_json(self.path, asdict(self.run))
+
+    def adopt(self, account: Account) -> None:
+        """Record that this live run now uses another login, holding it like the first."""
+        with self.store.lock(timeout=5):
+            self.store.account(account.name)
+            self.stack.enter_context(self.store.account_lock(account, shared=True))
+            self.run = replace(self.run, account=account.name)
             write_json(self.path, asdict(self.run))
 
     def close(self, *, ended: bool) -> None:

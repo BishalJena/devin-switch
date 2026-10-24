@@ -11,6 +11,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
+from devin_switch.executable import ds_command
 from devin_switch.store import Account, Store, SwitchError
 
 BUNDLED_CLI = Path(
@@ -52,9 +53,8 @@ def find_binary() -> Path:
     raise SwitchError("Devin CLI was not found. Install it or set DS_BINARY to its executable.")
 
 
-def github_config_directory(store: Store) -> str:
-    if configured := os.environ.get("GH_CONFIG_DIR"):
-        return configured
+def user_config_home(store: Store) -> Path:
+    """The incoming user-level XDG config directory, ignoring a Switch account's isolated one."""
     if configured := os.environ.get("XDG_CONFIG_HOME"):
         config = Path(configured).resolve()
         roots = {store.root.resolve()}
@@ -64,8 +64,12 @@ def github_config_directory(store: Store) -> str:
             config.parent.parent == root / "accounts" for root in roots
         )
         if not isolated:
-            return str(config / "gh")
-    return str(Path.home() / ".config/gh")
+            return config
+    return Path.home() / ".config"
+
+
+def github_config_directory(store: Store) -> str:
+    return os.environ.get("GH_CONFIG_DIR") or str(user_config_home(store) / "gh")
 
 
 @dataclass(frozen=True)
@@ -107,6 +111,8 @@ class Native:
             "DS_HOME": str(self.store.root),
             "DS_BINARY": str(self.binary),
         }
+        # Lets the whiteboard MCP keep one board per conversation across account handoffs.
+        environment.setdefault("WHITEBOARD_CHAT_COMMAND", ds_command("chat", "id"))
         if self.run_id:
             environment.update(
                 DS_RUN_ID=self.run_id,

@@ -127,6 +127,22 @@ def test_installed_acp_shared_history_without_login(
     asyncio.run(scenario())
 
 
+def test_installed_cli_shares_user_mcp_servers_across_logins(store, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    native = Native(store, Path(os.environ["DS_TEST_NATIVE"]))
+    first, second = store.accounts()
+    native.capture(first, ("mcp", "add", "-s", "user", "switch-shared", "--", "true"))
+    assert "switch-shared" in native.capture(second, ("mcp", "list"))
+    native.capture(second, ("mcp", "remove", "-s", "user", "switch-shared"))
+    assert "switch-shared" not in native.capture(first, ("mcp", "list"))
+    for account in (first, second):
+        config = store.directory(account.name) / "config/devin/mcp_config.json"
+        assert config.is_symlink()
+        assert config.resolve() == (store.root / "shared/config/mcp_config.json").resolve()
+        assert not store.credentials(account).exists()
+
+
 def test_installed_acp_new_chat_is_not_saved_before_a_prompt(store, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     native = Native(store, Path(os.environ["DS_TEST_NATIVE"]))
@@ -202,3 +218,72 @@ def test_installed_bridge_keeps_blank_chat_on_switch_and_releases_it_idle(
         assert not any(store.credentials(account).exists() for account in store.accounts())
 
     asyncio.run(scenario())
+
+
+def relay_test_native(store, tmp_path, monkeypatch):
+    from fake_upstream import Upstream
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Native, "require_login", lambda self, account: None)
+    native = Native(store, Path(os.environ["DS_TEST_NATIVE"]))
+    first = store.accounts()[0]
+    store.select(first)
+    upstream = Upstream([account.name for account in store.accounts()])
+    upstream.empty_status = True
+    store.credentials(first).write_text(upstream.credentials(first.name))
+    return native, first, upstream
+
+
+async def open_new_chat(native, cwd):
+    """Open a chat through the bridge; returns whether it relays, or the native's RPC code."""
+    bridge = Bridge(native, lambda message: asyncio.sleep(0))
+    try:
+        await bridge.dispatch("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+        created = await bridge.dispatch("session/new", {"cwd": str(cwd), "mcpServers": []})
+        return bridge.chats[created["sessionId"]].backend.relay is not None
+    except acp.RpcError as exc:
+        return exc.code
+    finally:
+        await bridge.close()
+
+
+def test_installed_cli_routes_api_traffic_through_the_relay(store, tmp_path, monkeypatch):
+    from fake_upstream import api_key
+
+    from devin_switch import relay
+
+    relayed = []
+    forward = relay.Handler.forward
+
+    def recording(handler, login, body):
+        relayed.append((handler.path, login.account.name))
+        return forward(handler, login, body)
+
+    monkeypatch.setattr(relay.Handler, "forward", recording)
+    native, first, upstream = relay_test_native(store, tmp_path, monkeypatch)
+    saved = store.credentials(first).read_text()
+    try:
+        assert asyncio.run(open_new_chat(native, tmp_path)) is True
+    finally:
+        upstream.close()
+    # The native keeps the host login in memory and never rewrites saved credentials.
+    assert store.credentials(first).read_text() == saved
+    paths = {path.rsplit("/", 1)[-1] for path, _ in relayed}
+    assert {"GetUserStatus", "GetCliTeamSettings"} <= paths
+    assert "GetChatMessage" not in paths
+    assert {account for _, account in relayed} == {first.name}
+    # The key travels in the body too: the relay's same-length swap depends on it.
+    assert all(api_key(first.name).encode() in request["raw"] for request in upstream.requests)
+
+
+def test_installed_cli_failed_host_login_behaves_like_no_relay(store, tmp_path, monkeypatch):
+    from devin_switch import relay
+
+    native, first, upstream = relay_test_native(store, tmp_path, monkeypatch)
+    upstream.close()
+    with_relay = asyncio.run(open_new_chat(native, tmp_path))
+    monkeypatch.setattr(relay, "login", lambda store, account: None)
+    without_relay = asyncio.run(open_new_chat(native, tmp_path))
+    assert with_relay is not True
+    assert with_relay == without_relay

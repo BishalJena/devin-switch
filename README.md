@@ -21,8 +21,8 @@ saved Devin CLI logins, checking reported usage, and reopening shared local conv
 - **Concurrent launches.** Open multiple sessions while protecting profiles from removal or
   replacement login while in use.
 
-There is no automatic quota failover, interrupted-request retry, or guarantee that a different
-account can continue every conversation. `ds next` cycles through saved logins; it does not
+Automatic failover only uses logins with confirmed remaining usage, and there is no guarantee
+that a different account can continue every conversation. `ds next` cycles through saved logins; it does not
 select an account based on remaining quota. Switch does not change the Devin Desktop IDE account.
 
 ## Quick start
@@ -198,7 +198,15 @@ the most remaining usage (using the same ranking as `!ds switch`), then sends ex
 It also makes that login the default. This setting applies to every chat right away, with no
 restart needed. If the setting file is unreadable, automatic switching stays off.
 
-- **GUI chats** use the native CLI's typed quota signals: a `-32011` / `resource_exhausted`
+- **GUI chats keep running, subagents included.** Each GUI chat with a saved API login routes
+  its agent's API traffic through a private loopback relay. When a request comes back with
+  "usage quota has been exhausted", the relay picks the next login with confirmed remaining
+  usage and replays that same request with it, inside the same agent process. Running
+  subagents keep their context and finish normally, `read_subagent` sees nothing unusual, and
+  no `continue` is sent. The chat, its session list entry and the default move to the new
+  login. Nothing is written to saved credentials, and keys are never logged.
+- **Fallback for GUI chats** (no saved API login, host login failed, or no login could take
+  over) uses the native CLI's typed quota signals: a `-32011` / `resource_exhausted`
   prompt error, or an `agent_stopped` event with cause `quota_exhausted`. The switch and the
   `continue` happen inside the same Desktop turn, so output keeps streaming into the chat.
   Rate limits that include a retry delay do not trigger a switch. Stopping the turn in Desktop
@@ -255,6 +263,69 @@ Use separate Git worktrees if concurrent sessions would otherwise edit the same 
   Removal and renaming are blocked while the profile is in use.
 
 CLI removal requires explicit confirmation: `ds remove work --yes`.
+
+### Let agents use a browser without interrupting you
+
+`ds browser install` registers one `browser` MCP server for every chat (Switch's shared MCP
+config and your user-level `~/.config/devin/mcp_config.json`). It also allows its tools
+(`mcp__browser__*`) in every saved login, in the user config, and in logins you add later. Old
+`chrome-devtools-mcp` entries are replaced. Restart open chats afterwards.
+
+```sh
+ds browser install --default you@example.com   # or a profile name or "Profile 3"
+```
+
+The agent never attaches to the Chrome you are using:
+
+- **One separate instance per Chrome profile.** The first time a chat names a profile, Switch
+  copies that profile's cookies and site storage into its own folder. Passwords, extensions,
+  history and service-worker caches are not copied, and Switch never decrypts the copies.
+  Your Chrome is only read. `ds browser refresh PROFILE` copies the logins again.
+- **Headless by default.** No window, no Dock icon and no focus change. Snapshots and
+  screenshots still render the full UI at 1440×900. The agent can ask for a visible window,
+  opened in the background, when you want to watch.
+- **No "Allow remote debugging" prompts.** Chrome is started with its own debugging port.
+- **Profiles on the fly.** Agents call `browser_profile` with an email, a profile name or a
+  directory. Without one, a chat uses the default profile. Each chat stays bound to its
+  profile, and different chats can use different profiles at the same time.
+- **Closed when finished.** Chats release the browser with `browser_close`, after 15 idle
+  minutes, or when they exit. A supervisor closes the instance about 10 seconds after the last
+  chat releases it, and the next browser tool call reopens it with fresh pages.
+
+`ds browser status` lists profiles and running instances, and `ds browser stop` closes them
+immediately. The server runs `npx -y chrome-devtools-mcp@1.10.1`, so Node.js is required.
+
+### Watch the agent's browser and canvas beside the chat
+
+`ds panels install` adds two panels to Devin Desktop (a small extension with no dependencies):
+
+```
+┌──────────── chat ────────────┬──────── Agent Browser / Canvas ────────┐
+│ you: why does login fail?    │ [profile ▾] ← → ⟳ [ address      ] ⦿ + │
+│ agent: opening the app…      │ ┌────────────────────────────────────┐ │
+│                              │ │  live view of the agent's Chrome   │ │
+│                              │ │  (click, type, scroll to take over)│ │
+│                              │ └────────────────────────────────────┘ │
+└──────────────────────────────┴────────────────────────────────────────┘
+```
+
+- **Agent Browser** (`Switch: Open Agent Browser`, or the globe in the status bar while an agent
+  browser runs) streams the agent's headless Chrome. It follows the tab the agent is using,
+  and you can click, type, paste, scroll, navigate, open tabs or pick another Chrome profile.
+  While the panel is open it holds the browser like a chat does, so Chrome stays open after
+  the agent is done; closing the panel releases it.
+- **Whiteboard** shows boards from
+  [whiteboard-mcp](https://github.com/ansuman-shukla/whiteboard-mcp). Each chat gets its own
+  board, and when the agent explains something visually it opens beside the chat in that chat's
+  own window, in its own tab named after the board. Other chats' boards keep their tabs, and a
+  window never shows a board from a chat in another window (that window has to run the panels
+  too: reload windows opened before an update). The extension connects to the whiteboard daemon
+  directly, so no browser tab and no restart of open chats is needed.
+  `Switch: Open Whiteboard` lists this workspace's boards (newest first) so you can reopen one
+  yourself. Setting `switchPanels.whiteboardHome` points at a non-default `WHITEBOARD_HOME`.
+
+Switch gives chats `WHITEBOARD_CHAT_COMMAND="ds chat id"` (unless you set it), so a chat keeps
+its board across account handoffs. `ds panels status` shows the installed version.
 
 ### Switch accounts inside Devin Desktop (experimental)
 
@@ -415,6 +486,13 @@ extension.
 | `ds sessions` | List shared history for the current project |
 | `ds verify FIRST SECOND` | Check A → B → A login and local-history visibility |
 | `ds remove ALIAS --yes` | Remove a local profile, preserving shared history |
+| `ds browser install [--default PROFILE]` | Register the agent browser MCP server for all chats and allow its tools |
+| `ds browser default PROFILE` | Choose the Chrome profile for chats that name none |
+| `ds browser status` | List Chrome profiles, cloned agent profiles and running instances |
+| `ds browser refresh PROFILE` | Copy a Chrome profile's logins into its agent profile again |
+| `ds browser stop [PROFILE]` | Close running agent browsers now |
+| `ds panels install` / `ds panels status` | Install or check the Desktop Agent Browser and Canvas panels |
+| `ds chat id` | Print the conversation a Desktop chat's process belongs to |
 
 `ds verify` makes no model request. Matching history across accounts is separate from a
 successful inference request; different credential files alone do not prove distinct users
@@ -435,9 +513,14 @@ handoffs/
 acp/sessions/
 acp/requests/
 acp/lifecycle/
+browser/profiles/<profile>/user-data/
 launchers/
 selected
 ```
+
+- Agent browser profiles hold copies of Chrome cookies and site storage. They are as
+  sensitive as your browser profile: the folders are private to your user, and the
+  `browser` MCP server gives agents full control of these logged-in sessions.
 
 - Native credentials are local files restricted to the current user, **not Keychain-encrypted**.
   Protect this directory and its backups as sensitive data.
@@ -464,6 +547,8 @@ selected
 | `DS_HOME` | Override Switch's private state directory; keep it outside the repository |
 | `DS_BINARY` | Choose the native Devin executable explicitly |
 | `DS_TEST_NATIVE` | Enable isolated, offline native-CLI compatibility tests |
+| `DS_CHROME_DATA`, `DS_BROWSER_CHROME`, `DS_BROWSER_MCP` | Tests only: fake Chrome data, Chrome executable and MCP child |
+| `DS_BROWSER_IDLE`, `DS_BROWSER_GRACE` | Seconds before an idle chat releases the browser (900), and before an unused one closes (10) |
 
 Never commit your state directory, environment files, signing certificates, or credentials.
 Ignore rules and secret scans provide safeguards, not a guarantee against every possible leak.

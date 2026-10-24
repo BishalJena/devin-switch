@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from devin_switch import acp_state, handoff, sessions
+from devin_switch import acp_state, handoff, relay, sessions
 from devin_switch.native import Native
 from devin_switch.store import Account, SwitchError, write_json
 
@@ -40,7 +40,10 @@ LOCAL_COMMANDS = [
 LOCAL_NAMES = {"/" + command["name"] for command in LOCAL_COMMANDS}
 AGENT_STOPPED = "_cognition.ai/agent_stopped"
 RESOURCE_EXHAUSTED = -32011
+RESOURCE_NOT_FOUND = -32002
 AUTO_SWITCH_LIMIT = 3
+CATALOG_ATTEMPTS = 3
+CATALOG_RETRY_DELAY = 1.0
 BLOCKED_COMMANDS = {"login", "logout", "org", "new", "resume"}
 LIVE_CONTROLS = {
     "session/set_config_option",
@@ -66,6 +69,10 @@ class RpcError(SwitchError):
         super().__init__(message)
         self.code = code
         self.data = data
+
+
+class CatalogUnavailable(SwitchError):
+    pass
 
 
 def quota_exhausted(error: RpcError) -> bool:
@@ -160,6 +167,8 @@ class Backend:
         self.suppress_replay = False
         self.stopping = False
         self.stop_cause = None
+        self.relay = None
+        self.loop = None
         self.last_activity = time.monotonic()
         bridge.backends.add(self)
 
@@ -220,10 +229,36 @@ class Backend:
                 raise SwitchError(
                     "This native CLI lacks compatible ACP session loading. Update Devin CLI."
                 )
+            if self.chat and (issued := relay.login(self.bridge.native.store, self.account)):
+                await self.authenticate(issued)
             return result
         except BaseException:
             await self.close()
             raise
+
+    async def authenticate(self, issued):
+        """Route the native's API traffic through a relay that can change logins in place."""
+        self.loop = asyncio.get_running_loop()
+        self.relay = relay.Relay(
+            issued, lambda current, tried: self.bridge.rotate(self, issued, current, tried)
+        )
+        try:
+            await self.request(
+                "authenticate",
+                {
+                    "methodId": "windsurf-api-key",
+                    "_meta": {"api_key": issued.key, "api_server_url": self.relay.url},
+                },
+                LIFECYCLE_TIMEOUT,
+            )
+        except RpcError:
+            # A failed host login (e.g. offline) leaves the native on its saved credentials.
+            await asyncio.to_thread(self.close_relay)
+
+    def close_relay(self):
+        if self.relay:
+            closing, self.relay = self.relay, None
+            closing.close()
 
     async def send(self, message):
         if not self.process or self.process.poll() is not None or self.writer.is_closing():
@@ -330,6 +365,7 @@ class Backend:
         self.lease.close(ended=True)
         self.bridge.drop_client_requests(self)
         self.close_pipes()
+        await asyncio.to_thread(self.close_relay)
 
     async def close(self):
         self.stopping = True
@@ -342,6 +378,7 @@ class Backend:
                 await asyncio.wait_for(asyncio.shield(self.watcher), SHUTDOWN_TIMEOUT)
             except TimeoutError:
                 return False
+        await asyncio.to_thread(self.close_relay)
         if self.lease:
             self.lease.close(ended=True)
         self.bridge.backends.discard(self)
@@ -867,6 +904,28 @@ class Bridge:
         return result
 
     async def restore(self, chat, account, settings, mode, model, *, setup=None, replay=False):
+        for attempt in range(1, CATALOG_ATTEMPTS + 1):
+            try:
+                return await self.restore_once(
+                    chat,
+                    account,
+                    settings,
+                    mode,
+                    model,
+                    setup=setup,
+                    replay=replay and attempt == 1,
+                )
+            except CatalogUnavailable:
+                if attempt == CATALOG_ATTEMPTS:
+                    raise
+            await self.note(
+                chat.session_id,
+                f"{account.name} has not loaded its options yet (slow network?); "
+                "retrying with a fresh agent…",
+            )
+            await asyncio.sleep(CATALOG_RETRY_DELAY * attempt)
+
+    async def restore_once(self, chat, account, settings, mode, model, *, setup, replay):
         setup = chat.setup if setup is None else setup
         candidate = Backend(self, account, Path(setup["cwd"]), chat.session_id)
         candidate.suppress_replay = not replay
@@ -881,16 +940,28 @@ class Bridge:
                 if current is None:
                     raise SwitchError("The destination cannot preserve this chat's configuration.")
                 if current["currentValue"] != option["currentValue"]:
-                    await candidate.request(
-                        "session/set_config_option",
-                        {
-                            "sessionId": chat.session_id,
-                            "configId": identifier,
-                            "value": option["currentValue"],
-                            **({"type": "boolean"} if option.get("type") == "boolean" else {}),
-                        },
-                        LIFECYCLE_TIMEOUT,
-                    )
+                    try:
+                        await candidate.request(
+                            "session/set_config_option",
+                            {
+                                "sessionId": chat.session_id,
+                                "configId": identifier,
+                                "value": option["currentValue"],
+                                **({"type": "boolean"} if option.get("type") == "boolean" else {}),
+                            },
+                            LIFECYCLE_TIMEOUT,
+                        )
+                    except RpcError as exc:
+                        if (
+                            exc.code == RESOURCE_NOT_FOUND
+                            and current.get("type") == "select"
+                            and not current.get("options")
+                        ):
+                            raise CatalogUnavailable(
+                                f"{account.name} could not load its {identifier} list "
+                                "(slow or unavailable network). No prompt was replayed."
+                            ) from exc
+                        raise
             if (
                 mode
                 and mode != candidate.mode
@@ -932,7 +1003,9 @@ class Bridge:
             candidate.suppress_replay = False
             return candidate, result
         except BaseException as exc:
-            await candidate.close()
+            closed = await candidate.close()
+            if isinstance(exc, CatalogUnavailable) and closed:
+                raise CatalogUnavailable(f"{stage}: {exc}") from exc
             if isinstance(exc, (SwitchError, OSError)):
                 raise SwitchError(f"{stage}: {failure_detail(exc)}") from exc
             raise
@@ -1015,6 +1088,26 @@ class Bridge:
                 else "Send your next message when ready."
             ),
         )
+
+    def rotate(self, backend, issued, current, tried):
+        """Pick the relay's next login when every login in `tried` ran out (relay thread)."""
+        store = self.native.store
+        try:
+            if not handoff.auto_switch_enabled(store):
+                return None
+            account, _ = handoff.choose_best(self.native, current.account.name, tried)
+            replacement = relay.login(store, account)
+            if replacement is None or not relay.compatible(issued, replacement):
+                return None
+            backend.lease.adopt(account)
+            with store.lock(timeout=5):
+                if backend.session_id:
+                    acp_state.bind(store, backend.session_id, account)
+                store.select(account)
+        except (SwitchError, OSError):
+            return None
+        backend.loop.call_soon_threadsafe(setattr, backend, "account", account)
+        return replacement
 
     async def queued_switch(self, chat, path):
         try:

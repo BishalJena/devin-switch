@@ -49,9 +49,17 @@ def signed_in(native: Native) -> Native:
 
 
 @pytest.fixture(autouse=True)
-def isolated_cli_state(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+def isolated_cli_state(store: Store, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("DS_HOME", str(store.root))
-    for name in ("DS_RUN_ID", "DS_ACP_RUN_ID", "DS_EXECUTABLE", "DS_FROZEN"):
+    monkeypatch.setenv("DS_DESKTOP_EXTENSIONS", str(tmp_path / "desktop-extensions"))
+    for name in (
+        "DS_RUN_ID",
+        "DS_ACP_RUN_ID",
+        "DS_EXECUTABLE",
+        "DS_FROZEN",
+        "WHITEBOARD_CHAT_COMMAND",
+        "WHITEBOARD_OPEN",
+    ):
         monkeypatch.delenv(name, raising=False)
     # No inherited authentication should reach any fixture subprocess.
     for name in tuple(os.environ):

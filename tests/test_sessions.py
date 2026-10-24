@@ -127,6 +127,31 @@ def test_removal_and_rename_refuse_account_in_use(
     assert signed_in.store.credentials(signed_in.store.accounts()[0]).exists()
 
 
+def test_live_gui_run_can_adopt_another_login_without_schema_change(
+    signed_in: Native, tmp_path: Path
+) -> None:
+    from devin_switch import acp_state, sessions
+
+    store = signed_in.store
+    first, second = store.accounts()
+    lease = acp_state.Lease(signed_in, first, tmp_path, None, chat=True)
+    try:
+        before = json.loads(lease.path.read_text())
+        lease.adopt(second)
+        after = json.loads(lease.path.read_text())
+        assert set(after) == set(before)
+        assert after == {**before, "account": second.name}
+        for account in (first, second):
+            with pytest.raises(SwitchError, match="in use"):
+                desktop.action(
+                    store, {"action": "remove", "account": account.name, "confirmed": "true"}
+                )
+        assert [run["account"] for run in sessions.runs(store)] == [second.name]
+    finally:
+        lease.close(ended=True)
+    store.remove(second)
+
+
 def test_exact_resume_uses_history_directory_and_rejects_duplicate(
     signed_in: Native, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
