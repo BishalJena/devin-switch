@@ -2,28 +2,27 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_call:
+    inputs:
+      release:
+        description: Also run the compatibility, audit and packaging jobs a release needs.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   checks:
-    name: Checks (${{ matrix.runner }}, Python ${{ matrix.python }})
-    runs-on: ${{ matrix.runner }}
+    name: Checks
+    runs-on: macos-15
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            python: "3.11"
-          - runner: macos-15-intel
-            python: "3.11"
-          - runner: macos-15
-            python: "3.13"
     steps:
       - uses: actions/checkout@v4.2.2
         with:
@@ -32,22 +31,51 @@ jobs:
       - uses: astral-sh/setup-uv@v6.0.1
         with:
           version: "0.11.19"
-          python-version: ${{ matrix.python }}
+          python-version: "3.11"
           enable-cache: true
       - run: uv sync --locked
       - run: make lint test typecheck
       - name: Install pinned secret scanner
+        if: inputs.release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           uv run --locked python scripts/install_gitleaks.py "$RUNNER_TEMP/gitleaks-bin"
           echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
-      - run: make secrets build
+      - if: inputs.release
+        run: make secrets build
       - name: Audit packages and verify isolated uv installation
+        if: inputs.release
         run: uv run --locked python scripts/check_dist.py
+
+  compatibility:
+    name: Compatibility (${{ matrix.runner }}, Python ${{ matrix.python }})
+    if: inputs.release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            python: "3.11"
+          - runner: macos-15
+            python: "3.13"
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6.0.1
+        with:
+          version: "0.11.19"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --locked
+      - run: make test
 
   macos-package:
     name: Portable app (${{ matrix.runner }})
+    if: inputs.release
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     strategy:
