@@ -103,6 +103,67 @@ def quota_frame(head: bytes, encoding: str | None) -> bool:
     return isinstance(message, str) and QUOTA_MESSAGE.search(message) is not None
 
 
+def messages(body: bytes, headers) -> list[bytes] | None:
+    """The request's decompressed message bytes, or None when it is not gzip-compressed."""
+    if (headers.get("Content-Encoding") or "").lower() == "gzip":
+        return [gzip.decompress(body)]
+    streaming = (headers.get("Content-Type") or "").startswith("application/connect")
+    if not streaming or (headers.get("Connect-Content-Encoding") or "").lower() != "gzip":
+        return None
+    result, index = [], 0
+    while index < len(body):
+        if index + 5 > len(body):
+            raise ValueError("Truncated Connect envelope")
+        flags, size = body[index], int.from_bytes(body[index + 1 : index + 5], "big")
+        payload = body[index + 5 : index + 5 + size]
+        if len(payload) != size:
+            raise ValueError("Truncated Connect message")
+        result.append(gzip.decompress(payload) if flags & COMPRESSED else payload)
+        index += 5 + size
+    return result
+
+
+def swap_key(body: bytes, headers, old: bytes, new: bytes) -> bytes:
+    """Replace the issued key in a request body, including inside gzip-compressed messages.
+
+    The native gzips large Connect streams (its chat requests); a key inside them is invisible
+    to a plain byte replacement, and the server then bills the issued login whatever the
+    header says. Keys have the same length, so protobuf lengths stay valid; only the
+    compressed envelopes are rebuilt. Anything unparseable falls back to a plain replacement.
+    """
+    if old == new:
+        return body
+    try:
+        if (headers.get("Content-Encoding") or "").lower() == "gzip":
+            return gzip.compress(gzip.decompress(body).replace(old, new))
+        if messages(body, headers) is not None:
+            frames, index = [], 0
+            while index < len(body):
+                flags, size = body[index], int.from_bytes(body[index + 1 : index + 5], "big")
+                payload = body[index + 5 : index + 5 + size]
+                if flags & COMPRESSED:
+                    payload = gzip.compress(gzip.decompress(payload).replace(old, new))
+                else:
+                    payload = payload.replace(old, new)
+                frames.append(bytes([flags]) + len(payload).to_bytes(4, "big") + payload)
+                index += 5 + size
+            return b"".join(frames)
+    except (OSError, EOFError, ValueError):
+        pass
+    return body.replace(old, new)
+
+
+def carries_key(body: bytes, headers, key: bytes) -> bool:
+    """Whether the issued key is in the body, looking inside gzip-compressed messages."""
+    if key in body:
+        return True
+    try:
+        decoded = messages(body, headers)
+    except (OSError, EOFError, ValueError):
+        return False
+    return decoded is not None and any(key in message for message in decoded)
+
+
 def first_frame(response: http.client.HTTPResponse) -> bytes:
     """Read just enough of a Connect stream to classify its first frame."""
     head = b""
@@ -236,9 +297,8 @@ class Handler(BaseHTTPRequestHandler):
         if body is None:
             return self.refuse(400)
         # Only the native knows the issued key; some calls (analytics) carry it only in the body.
-        if (
-            relay.issued.key not in self.headers.get("Authorization", "")
-            and relay.issued.key.encode() not in body
+        if relay.issued.key not in self.headers.get("Authorization", "") and not carries_key(
+            body, self.headers, relay.issued.key.encode()
         ):
             return self.refuse(403)
         tried = set()
@@ -308,7 +368,7 @@ class Handler(BaseHTTPRequestHandler):
             connection.request(
                 self.command,
                 parts.path + self.path,
-                body=body.replace(issued.key.encode(), login.key.encode()),
+                body=swap_key(body, self.headers, issued.key.encode(), login.key.encode()),
                 headers=headers,
             )
             return connection, connection.getresponse()
