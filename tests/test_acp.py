@@ -2089,7 +2089,8 @@ def test_gui_subagents_stopped_by_a_crash_resume_from_their_saved_progress(
                 bridge.dispatch("session/prompt", prompt_params(session_id, "subagents"))
             )
             await until(lambda: backend.running == {"s1", "s2"})
-            assert set(subagents.load(store, session_id)["running"]) == {"s1", "s2"}
+            # The saved record is written right after, off the event loop.
+            await until(lambda: set(subagents.load(store, session_id)["running"]) == {"s1", "s2"})
             # Idle release never stops a chat whose subagents are still working.
             turn_gate, chat.gate = chat.gate, asyncio.Lock()
             backend.last_activity -= acp.IDLE_TIMEOUT + 1
