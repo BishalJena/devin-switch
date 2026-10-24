@@ -4,7 +4,8 @@ import re
 import shlex
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from devin_switch import sessions, usage
@@ -25,6 +26,15 @@ HOOK_COMMAND = (
 )
 HOOK = {"matcher": "", "hooks": [{"type": "command", "command": HOOK_COMMAND, "timeout": 5}]}
 CONTINUE_PROMPT = "continue"
+FULL_ALLOWANCE = 100
+# The CLI exports only when its user config names a destination. Each terminal launch overrides
+# this inert placeholder with a private receiver; other launches fail fast on the closed port.
+TELEMETRY = {
+    "logs_endpoint": "http://127.0.0.1:9/v1/logs",
+    "log_export_interval_ms": 1000,
+    "disable_user_prompt_logging": True,
+    "disable_tool_logging": True,
+}
 
 
 def settings_path(store: Store) -> Path:
@@ -82,6 +92,37 @@ def member_start(source: str, start: int, name: str) -> int | None:
             index += 1
 
 
+def config_path(store: Store, account: Account) -> Path:
+    return store.directory(account.name) / "config/devin/config.json"
+
+
+def with_telemetry(original: str) -> str:
+    source = json_source(original)
+    config = json.loads(source)
+    if "otel" in config:
+        return original
+    index = source.index("{") + 1
+    addition = '"otel":' + json.dumps(TELEMETRY) + ("," if config else "")
+    return original[:index] + addition + original[index:]
+
+
+def telemetry_owned(config: object) -> bool:
+    """Only redirect logs whose configured destination is Switch's inert placeholder."""
+    otel = config.get("otel") if isinstance(config, dict) else None
+    return (
+        isinstance(otel, dict)
+        and otel.get("enabled", True) is not False
+        and otel.get("logs_endpoint") == TELEMETRY["logs_endpoint"]
+    )
+
+
+def telemetry_enabled(store: Store, account: Account) -> bool:
+    try:
+        return telemetry_owned(json.loads(json_source(config_path(store, account).read_text())))
+    except (OSError, ValueError):
+        return False
+
+
 def append_member(original: str, path: tuple[str, ...], item: object) -> str | None:
     """Add item to the list at path, keeping JSONC comments; None when it is already present."""
     source = json_source(original)
@@ -109,13 +150,18 @@ def append_member(original: str, path: tuple[str, ...], item: object) -> str | N
 
 
 def extend_config(path: Path, member: tuple[str, ...], item: object) -> None:
+    update_config(path, lambda original: append_member(original, member, item))
+
+
+def update_config(path: Path, change: Callable[[str], str | None]) -> None:
+    """Rewrite a JSONC config atomically; `change` returns None when nothing changes."""
     if path.is_symlink() or path.parent.is_symlink() or path.parent.parent.is_symlink():
         raise SwitchError(
             "Refusing to change linked profile config; existing settings are unchanged."
         )
     original = path.read_text() if path.exists() else "{}"
     try:
-        updated = append_member(original, member, item)
+        updated = change(original)
         if updated is None:
             return
         json.loads(json_source(updated))
@@ -123,6 +169,8 @@ def extend_config(path: Path, member: tuple[str, ...], item: object) -> None:
         raise SwitchError(
             "Cannot extend this profile's config; existing settings were preserved."
         ) from exc
+    if updated == original:
+        return
     private_directory(path.parent)
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as handle:
         temporary = Path(handle.name)
@@ -138,9 +186,12 @@ def extend_config(path: Path, member: tuple[str, ...], item: object) -> None:
 
 
 def enable(store: Store, account: Account) -> None:
-    extend_config(
-        store.directory(account.name) / "config/devin/config.json", ("hooks", "SessionEnd"), HOOK
-    )
+    def change(original: str) -> str | None:
+        hooked = append_member(original, ("hooks", "SessionEnd"), HOOK) or original
+        updated = with_telemetry(hooked)
+        return None if updated == original else updated
+
+    update_config(config_path(store, account), change)
 
 
 def choose_best(
@@ -157,21 +208,40 @@ def choose_best(
     def check(account: Account) -> tuple[Account, float] | None:
         try:
             with store.account_lock(account, shared=True):
-                reading = usage.refresh_account(store, account, force=True)
-                remaining = usage.remaining_allowance(reading)
+                remaining = usage.remaining_allowance(usage.read_cached(store, account))
+                if remaining is None:
+                    reading = usage.refresh_account(store, account, force=True)
+                    remaining = usage.remaining_allowance(reading)
                 return (account, remaining) if remaining is not None and remaining > 0 else None
         except SwitchError:
             return None
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        available = [result for result in executor.map(check, accounts) if result is not None]
-    for account, remaining in sorted(available, key=lambda result: (-result[1], result[0].name)):
-        try:
-            with store.account_lock(account, shared=True):
-                if native.authenticated(account):
-                    return account, remaining
-        except SwitchError:
-            continue
+    def candidates(stop_when_full: bool) -> tuple[list[tuple[Account, float]], bool]:
+        found = []
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(check, account) for account in accounts]
+            for future in as_completed(futures):
+                if (result := future.result()) is not None:
+                    found.append(result)
+                    if stop_when_full and result[1] >= FULL_ALLOWANCE:
+                        for pending in futures:
+                            pending.cancel()
+                        return found, True
+        return found, False
+
+    for stop_when_full in (True, False):
+        available, stopped = candidates(stop_when_full)
+        for account, remaining in sorted(
+            available, key=lambda result: (-result[1], result[0].name)
+        ):
+            try:
+                with store.account_lock(account, shared=True):
+                    if native.authenticated(account):
+                        return account, remaining
+            except SwitchError:
+                continue
+        if not stopped:
+            break
     raise SwitchError(
         "No other saved login has confirmed remaining usage. This chat is unchanged. "
         "If usage is unavailable, choose an account explicitly: !ds switch ALIAS."
@@ -263,15 +333,28 @@ def queue(
     )
 
 
-def queue_automatic(native: Native, account: Account) -> str | None:
+def queue_automatic(
+    native: Native, account: Account, progress: Callable[[str], None] | None = None
+) -> str | None:
     """Queue a continuing handoff only when fresh usage confirms this account is exhausted."""
     store = native.store
     if native.run_id is None or not auto_switch_enabled(store):
         return None
+    if progress is not None:
+        progress(
+            f"Quota alert on {account.name}. Checking usage to switch automatically; "
+            "keep this chat open."
+        )
     with store.account_lock(account, shared=True):
         reading = usage.refresh_account(store, account, force=True)
-    if usage.remaining_allowance(reading) != 0:
-        return None
+    remaining = usage.remaining_allowance(reading)
+    if remaining is None:
+        return (
+            f"Could not confirm {account.name}'s usage, so this chat is unchanged. "
+            "To switch anyway: !ds switch."
+        )
+    if remaining:
+        return f"{account.name} still reports {remaining:g}% remaining; this chat is unchanged."
     try:
         destination, remaining = choose_best(native, account.name)
     except SwitchError as exc:

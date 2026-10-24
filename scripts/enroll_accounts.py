@@ -41,10 +41,12 @@ from pathlib import Path
 CHROME_APP = "/Applications/Google Chrome.app"
 CHROME_DATA = Path.home() / "Library/Application Support/Google/Chrome"
 LOGIN_URL = re.compile(r"https://app\.devin\.ai/auth/cli/continue\?\S*?cli_pkce_marker=1")
+ANY_LOGIN_URL = re.compile(r"https://\S*?cli_pkce_marker=1")
 ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
 LONG_VALUE = re.compile(r"[A-Za-z0-9_\-\.]{20,}")
 CODE_SUBJECT = 'subject:"Devin Login Code" in:anywhere newer_than:15m'
 RATE_LIMIT_WAIT = 300
+OTHER_LOGIN_RETRIES = 3
 CLEANUP_SCRIPT = """
 on run keep
   set closed to 0
@@ -77,6 +79,10 @@ class RateLimited(EnrollError):
     pass
 
 
+class OtherLogin(EnrollError):
+    pass
+
+
 @dataclass(frozen=True)
 class Target:
     number: int
@@ -106,10 +112,17 @@ def targets(args: argparse.Namespace) -> list[Target]:
     ]
 
 
+def flat_text(output: bytes) -> str:
+    return re.sub(rb"[\r\n]", b"", ANSI.sub(b"", output)).decode(errors="ignore")
+
+
 def login_url(output: bytes) -> str | None:
-    text = re.sub(rb"[\r\n]", b"", ANSI.sub(b"", output)).decode(errors="ignore")
-    match = LOGIN_URL.search(text)
+    match = LOGIN_URL.search(flat_text(output))
     return match.group(0) if match else None
+
+
+def other_login_url(output: bytes) -> bool:
+    return login_url(output) is None and bool(ANY_LOGIN_URL.search(flat_text(output)))
 
 
 def redact(text: str) -> str:
@@ -208,6 +221,13 @@ class Login:
                 except OSError:
                     return
 
+    def finish(self, seconds: float) -> int | None:
+        end = time.time() + seconds
+        while self.process.poll() is None and time.time() < end:
+            self.pump(1)
+        self.pump(0.5)
+        return self.process.poll()
+
     def text(self) -> str:
         return ANSI.sub(b"", self.output).decode(errors="ignore")
 
@@ -217,6 +237,8 @@ class Login:
             await loop.run_in_executor(None, self.pump, 1)
             if url := login_url(self.output):
                 return url
+            if other_login_url(self.output):
+                raise OtherLogin("ds login offered a non-Devin sign-in page")
             if "already has a saved login" in self.text() or self.process.poll() is not None:
                 break
         raise EnrollError("ds login did not print a sign-in URL: " + redact(self.text())[-300:])
@@ -225,10 +247,10 @@ class Login:
         os.write(self.master, code.encode())
         await asyncio.sleep(0.5)
         os.write(self.master, b"\r")
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self.pump, 20)
-        status = await loop.run_in_executor(None, lambda: self.process.wait(timeout=60))
+        status = await asyncio.get_running_loop().run_in_executor(None, self.finish, 80)
         last = redact(self.text()).strip().splitlines()[-1:] or [""]
+        if status is None:
+            raise EnrollError(f"ds login did not finish after the code: {last[0][:200]}")
         if status:
             raise EnrollError(f"ds login exited {status}: {last[0][:200]}")
         return last[0]
@@ -347,19 +369,33 @@ class Enroller:
         subprocess.run(("osascript", "-e", CLEANUP_SCRIPT, *keep), capture_output=True)
 
     async def enroll(self, target: Target) -> str:
-        for _ in range(self.args.rate_limit_retries + 1):
+        waits = others = 0
+        while True:
             login = Login(self.args.ds, target.alias)
             try:
                 url = await login.wait_url()
                 await login.submit(await self.cli_code(target, url))
                 return verify(target, self.args.plan)
             except RateLimited:
+                waits += 1
+                if waits > self.args.rate_limit_retries:
+                    raise EnrollError(
+                        "Still rate limited; rerun later. Finished accounts are skipped."
+                    ) from None
                 print(f"  rate limited; waiting {RATE_LIMIT_WAIT // 60} minutes", flush=True)
+                delay = RATE_LIMIT_WAIT
+            except OtherLogin:
+                others += 1
+                if others > OTHER_LOGIN_RETRIES:
+                    raise EnrollError(
+                        "ds login keeps offering a non-Devin sign-in page; rerun later."
+                    ) from None
+                print("  ds login offered a non-Devin sign-in page; retrying", flush=True)
+                delay = 5
             finally:
                 login.close()
                 self.cleanup()
-            await asyncio.sleep(RATE_LIMIT_WAIT)
-        raise EnrollError("Still rate limited; rerun later. Finished accounts are skipped.")
+            await asyncio.sleep(delay)
 
 
 def signed_in(alias: str) -> bool:

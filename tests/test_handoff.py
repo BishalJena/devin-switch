@@ -91,6 +91,26 @@ def test_automatic_hook_preserves_profile_configuration(store, tmp_path, content
     handoff.enable(store, account)
     assert path.read_text() == first
     assert not (tmp_path / ".devin").exists()
+    assert installed["otel"] == handoff.TELEMETRY
+    assert handoff.telemetry_enabled(store, account)
+
+
+@pytest.mark.parametrize(
+    "otel",
+    [
+        {"endpoint": "https://collector.example.invalid"},
+        {**handoff.TELEMETRY, "enabled": False},
+        None,
+    ],
+)
+def test_existing_telemetry_configuration_is_never_redirected(store, otel):
+    account = store.accounts()[0]
+    path = store.directory(account.name) / "config/devin/config.json"
+    path.write_text(json.dumps({"theme_mode": "dark", "otel": otel}))
+    handoff.enable(store, account)
+    installed = json.loads(path.read_text())
+    assert installed["otel"] == otel and handoff.HOOK in installed["hooks"]["SessionEnd"]
+    assert not handoff.telemetry_enabled(store, account)
 
 
 @pytest.mark.parametrize(
@@ -703,14 +723,103 @@ def test_automatic_terminal_handoff_requires_confirmed_exhaustion(
             handoff.queue(
                 store, {"id": runner.run_id, "account": account.name}, store.accounts()[1]
             )
-        message = handoff.queue_automatic(runner, account)
+        notices = []
+        message = handoff.queue_automatic(runner, account, notices.append)
+        assert len(notices) == (case != "disabled")
+        assert all("keep this chat open" in notice for notice in notices)
         if case == "exhausted":
             assert "ansuman-2" in message and "continue" in message
             request = json.loads(path.read_text())
             assert request["account"] == "ansuman-2"
             assert request["continue"] is True and request["automatic"] is True
         else:
-            assert message is None
+            if case == "remaining":
+                assert "60% remaining" in message and "unchanged" in message
+            elif case == "unknown":
+                assert "Could not confirm" in message and "unchanged" in message
+            else:
+                assert message is None
             assert path.exists() == (case == "pending")
             if case == "pending":
                 assert json.loads(path.read_text())["automatic"] is False
+
+
+def full_usage(used: float = 0) -> usage.Usage:
+    import time
+
+    now = time.time()
+    return usage.Usage(
+        status="ok",
+        daily=usage.Window(used, now + 3600, "available"),
+        weekly=usage.Window(used, now + 86400, "available"),
+        fetched_at=now,
+        checked_at=now,
+    )
+
+
+def add_logins(native: Native, count: int) -> None:
+    with native.store.lock():
+        for index in range(3, 3 + count):
+            account = native.store.add(f"ansuman-{index}", None)
+            native.store.credentials(account).write_text(f"valid-{account.name}")
+
+
+def test_best_account_reuses_fresh_readings_and_refreshes_stale_ones(signed_in, monkeypatch):
+    from dataclasses import asdict, replace
+
+    add_logins(signed_in, 2)
+    store = signed_in.store
+    for name, used, age in (("ansuman-2", 30, 0), ("ansuman-3", 10, usage.STALE_SECONDS + 5)):
+        account = store.account(name)
+        reading = full_usage(used)
+        reading = replace(reading, fetched_at=reading.fetched_at - age)
+        (store.directory(name) / "usage.json").write_text(
+            json.dumps(
+                {
+                    "credential_fingerprint": usage.fingerprint(
+                        usage.credential_bytes(store, account)
+                    ),
+                    "usage": asdict(reading),
+                }
+            )
+        )
+    refreshed = []
+
+    def refresh(store, account, *, force):
+        assert force
+        refreshed.append(account.name)
+        return full_usage(50)
+
+    monkeypatch.setattr(usage, "refresh_account", refresh)
+    assert handoff.choose_best(signed_in, "ansuman-1") == (store.account("ansuman-2"), 70)
+    assert sorted(refreshed) == ["ansuman-3", "ansuman-4"]
+
+
+def test_best_account_stops_at_first_full_allowance(signed_in, monkeypatch):
+    import time
+
+    add_logins(signed_in, 8)
+    refreshed = []
+
+    def refresh(store, account, *, force):
+        refreshed.append(account.name)
+        if account.name != "ansuman-2":
+            time.sleep(0.3)
+        return full_usage(0 if account.name == "ansuman-2" else 10)
+
+    monkeypatch.setattr(usage, "refresh_account", refresh)
+    best = signed_in.store.account("ansuman-2")
+    assert handoff.choose_best(signed_in, "ansuman-1") == (best, 100)
+    assert "ansuman-2" in refreshed and len(refreshed) <= 5
+
+
+def test_best_account_keeps_searching_when_full_login_is_signed_out(signed_in, monkeypatch):
+    add_logins(signed_in, 1)
+    store = signed_in.store
+    store.credentials(store.account("ansuman-2")).write_text("expired")
+    monkeypatch.setattr(
+        usage,
+        "refresh_account",
+        lambda store, account, *, force: full_usage(0 if account.name == "ansuman-2" else 25),
+    )
+    assert handoff.choose_best(signed_in, "ansuman-1") == (store.account("ansuman-3"), 75)

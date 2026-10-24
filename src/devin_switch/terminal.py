@@ -13,9 +13,11 @@ import termios
 import threading
 import time
 import tty
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 
-from devin_switch import handoff
+from devin_switch import handoff, otel
+from devin_switch.native import TELEMETRY_VARIABLE
 from devin_switch.store import Store, SwitchError
 
 
@@ -90,31 +92,53 @@ TERMINAL_ESCAPE = re.compile(
 
 @dataclass
 class QuotaWatch:
-    """Notice the CLI's quota alert; the handoff itself requires fresh usage confirmation."""
+    """Notice the CLI's quota error; the handoff itself requires fresh usage confirmation.
+
+    Typed telemetry errors are authoritative and bypass the text cooldown, so an earlier false
+    text match cannot hide them. Rendered alert text remains a fallback hint.
+    """
 
     native: object
     account: object
     cooldown: float = 60
+    same_incident: float = 10
     tail: bytes = b""
     next_check: float = 0
+    last_check: float | None = None
     worker: threading.Thread | None = None
     messages: queue.SimpleQueue = field(default_factory=queue.SimpleQueue)
+    signals: queue.SimpleQueue = field(default_factory=queue.SimpleQueue)
+
+    def record(self, event: dict) -> None:
+        if otel.quota_exhausted(event):
+            self.signals.put(True)
 
     def feed(self, output: bytes, now: float) -> None:
-        self.tail = TERMINAL_ESCAPE.sub(b"", self.tail + output)[-512:]
-        if (
-            now < self.next_check
-            or (self.worker is not None and self.worker.is_alive())
-            or not QUOTA_TEXT.search(self.tail)
-        ):
+        text = TERMINAL_ESCAPE.sub(b"", self.tail + output)
+        self.tail = text[-512:]
+        if now >= self.next_check and QUOTA_TEXT.search(text):
+            self.start(now)
+
+    def poll(self, now: float) -> None:
+        signaled = False
+        while True:
+            try:
+                signaled = self.signals.get_nowait() or signaled
+            except queue.Empty:
+                break
+        if signaled and (self.last_check is None or now - self.last_check >= self.same_incident):
+            self.start(now)
+
+    def start(self, now: float) -> None:
+        if self.worker is not None and self.worker.is_alive():
             return
-        self.tail, self.next_check = b"", now + self.cooldown
+        self.tail, self.next_check, self.last_check = b"", now + self.cooldown, now
         self.worker = threading.Thread(target=self.check, daemon=True)
         self.worker.start()
 
     def check(self) -> None:
         try:
-            message = handoff.queue_automatic(self.native, self.account)
+            message = handoff.queue_automatic(self.native, self.account, self.messages.put)
         except (SwitchError, OSError):
             message = "Automatic switching could not check usage. This chat is unchanged."
         if message:
@@ -151,14 +175,20 @@ def run(native, account, arguments: tuple[str, ...]) -> int:
 
     try:
         resize()
-        with native.store.lock(f"controller-{native.run_id}.lock"):
+        with ExitStack() as stack:
+            stack.enter_context(native.store.lock(f"controller-{native.run_id}.lock"))
+            watch = QuotaWatch(native, account)
+            environment = native.environment(account)
+            if handoff.telemetry_enabled(native.store, account):
+                receiver = stack.enter_context(otel.Receiver(watch.record))
+                environment[TELEMETRY_VARIABLE] = receiver.endpoint
             with native.launch_selection(account):
                 process = subprocess.Popen(
                     (str(native.binary), *arguments),
                     stdin=slave,
                     stdout=slave,
                     stderr=slave,
-                    env=native.environment(account),
+                    env=environment,
                     pass_fds=native.lock_fds,
                     start_new_session=True,
                     preexec_fn=claim_terminal,
@@ -169,7 +199,6 @@ def run(native, account, arguments: tuple[str, ...]) -> int:
             signal.signal(signal.SIGWINCH, resize)
             tty.setraw(input_fd)
             request = ExitRequest(native.store, native.run_id)
-            watch = QuotaWatch(native, account)
             while True:
                 ready, _, _ = select.select([master, input_fd], [], [], 0.05)
                 if master in ready:
@@ -190,6 +219,7 @@ def run(native, account, arguments: tuple[str, ...]) -> int:
                     if not incoming:
                         break
                     write_all(master, incoming)
+                watch.poll(time.monotonic())
                 keys, status = request.advance(time.monotonic())
                 if keys and process.poll() is None:
                     write_all(master, keys)
