@@ -78,7 +78,11 @@ def subagent_update(session_id, key, value):
 
 
 async def subagent(session_id, agent_id):
-    subagent_update(session_id, "cognition.ai/subagent_started", {"agentId": agent_id})
+    subagent_update(
+        session_id,
+        "cognition.ai/subagent_started",
+        {"agentId": agent_id, "title": f"Title {agent_id}", "task": f"Task for {agent_id}"},
+    )
     gate = Path(os.environ["FAKE_SUBAGENT_GATE"])
     while not gate.exists():
         await asyncio.sleep(0.02)
@@ -371,9 +375,11 @@ async def handle(message):
     elif method == "session/list":
         result = {
             "sessions": [
-                {"sessionId": row[0], "cwd": row[2], "title": row[1]}
+                {"sessionId": row[0], "cwd": row[2], "title": row[1], "_meta": {"fake/row": True}}
                 for row in connection.execute("SELECT * FROM sessions")
-            ]
+                if not params.get("cwd") or row[2] == params["cwd"]
+            ],
+            **({"nextCursor": "fake-next"} if params.get("limit") else {}),
         }
     if "id" in message:
         emit({"id": message["id"], "result": result})

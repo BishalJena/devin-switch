@@ -248,7 +248,7 @@ def execute(args: argparse.Namespace, store: Store) -> int:
                         with store.lock(timeout=5):
                             handoff.enable(store, account)
                         print(
-                            "Low on usage? !ds switch resumes here with the best available login; "
+                            "Low on usage? !ds switch resumes here on the next login with credits; "
                             "add --continue to keep working."
                             + (" Auto-switch is on." if handoff.auto_switch_enabled(store) else ""),
                             file=sys.stderr,

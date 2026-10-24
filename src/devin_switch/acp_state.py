@@ -122,6 +122,69 @@ def queue_close(store: Store, run_id: str) -> str:
     )
 
 
+def orphaned(store: Store, run_id: str) -> bool:
+    """A GUI run whose bridge has exited while its native is still shutting down.
+
+    Only GUI leases create the controller lock file, and only the bridge holds it; the native
+    keeps the run lock, so the run stays active until it exits on its own.
+    """
+    controller = f"acp-controller-{run_id}.lock"
+    return (store.root / controller).exists() and not store.locked(controller)
+
+
+def request_handover(
+    store: Store, session_id: str, own: set[str]
+) -> tuple[list[str], list[str], list[str]]:
+    """Ask other windows' GUI connections holding this conversation to release it when idle.
+
+    Returns the runs newly asked to close, every live GUI run to wait for, and the orphaned
+    natives (bridge gone, e.g. after an ACP reload) that are still shutting down. Terminal
+    launches, older bridges without lifecycle sidecars and runs with a pending switch are
+    left alone, so their usual duplicate-launch error still applies.
+    """
+    asked, holders, orphans = [], [], []
+    with store.lock(timeout=5):
+        for run in sessions.runs(store):
+            if (
+                not run["active"]
+                or run["kind"] != "chat"
+                or run["session_id"] != session_id
+                or run["id"] in own
+            ):
+                continue
+            try:
+                state = lifecycle(store, run["id"])
+            except SwitchError:
+                continue
+            if orphaned(store, run["id"]):
+                orphans.append(run["id"])
+                continue
+            if state is None or request_path(store, run["id"]).exists():
+                continue
+            if state == "open":
+                set_lifecycle(store, run["id"], "close_requested")
+                asked.append(run["id"])
+            holders.append(run["id"])
+    return asked, holders, orphans
+
+
+def held(store: Store, session_id: str, holders: list[str]) -> bool:
+    return any(
+        run["active"] and run["id"] in holders and run["session_id"] == session_id
+        for run in sessions.runs(store)
+    )
+
+
+def cancel_handover(store: Store, asked: list[str]) -> None:
+    with store.lock(timeout=5):
+        for run_id in asked:
+            try:
+                if lifecycle(store, run_id) == "close_requested":
+                    set_lifecycle(store, run_id, "open")
+            except SwitchError:
+                continue
+
+
 def check_switchable(store: Store, run_id: str) -> None:
     if lifecycle(store, run_id) not in (None, "open"):
         raise SwitchError(
@@ -254,13 +317,26 @@ class Lease:
             self.close(ended=True)
             raise
 
-    def attach(self, session_id: str) -> None:
+    def attach(self, session_id: str, project: Path | None = None, *, saved: bool = False) -> None:
+        """Bind this run to a conversation; a warm spare also takes the chat's project.
+
+        `saved` repeats the checks a chat lease makes when created for a saved conversation.
+        """
         session_key(session_id)
         with self.store.lock(timeout=5):
+            if saved:
+                chat = sessions.resumable(self.store, session_id)
+                if project is not None and chat["project"] != str(project):
+                    raise SwitchError("Resume this conversation from its original project.")
             others = [run for run in sessions.runs(self.store) if run["id"] != self.run.id]
             if blocker := sessions.resume_blocker({"id": session_id}, others):
                 raise SwitchError(blocker)
-            self.run = replace(self.run, session_id=session_id)
+            self.run = replace(
+                self.run,
+                session_id=session_id,
+                kind="chat",
+                project=str(project) if project is not None else self.run.project,
+            )
             write_json(self.path, asdict(self.run))
 
     def adopt(self, account: Account) -> None:
