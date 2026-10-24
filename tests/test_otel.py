@@ -75,3 +75,19 @@ def test_receiver_accepts_only_its_private_path():
         assert received == []
         assert post(receiver.endpoint, encode_logs([QUOTA])) == 200
     assert [otel.quota_exhausted(record) for record in received] == [True]
+
+
+def test_loopback_servers_start_without_a_reverse_dns_lookup(monkeypatch):
+    import socket
+
+    from devin_switch import relay
+    from devin_switch.store import Account
+
+    def lookup(*_args):
+        raise AssertionError("HTTPServer.server_bind looked up the host name")
+
+    monkeypatch.setattr(socket, "getfqdn", lookup)
+    with otel.Receiver(lambda record: None) as receiver:
+        assert receiver.endpoint.startswith("http://127.0.0.1:")
+    login = relay.Login(Account("ansuman-1", None), "k" * 48, "http://127.0.0.1:9")
+    relay.Relay(login, lambda current, tried: None).close()

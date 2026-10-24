@@ -1,5 +1,6 @@
 """An offline stand-in for the Devin API server, keyed by each fake login's API key."""
 
+import gzip
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +21,19 @@ def frame(flags: int, payload: bytes) -> bytes:
 
 def reply(account: str) -> bytes:
     return frame(0, f"reply from {account}".encode()) + frame(2, b"{}")
+
+
+def readable(body: bytes, headers) -> str:
+    """The body as text, inflating gzip Connect messages like the real server does."""
+    if (headers.get("Connect-Content-Encoding") or "").lower() == "gzip":
+        parts, index = [], 0
+        while index + 5 <= len(body):
+            flags, size = body[index], int.from_bytes(body[index + 1 : index + 5], "big")
+            payload = body[index + 5 : index + 5 + size]
+            parts.append(gzip.decompress(payload) if flags & 1 else payload)
+            index += 5 + size
+        body = b"".join(parts)
+    return body.decode(errors="replace")
 
 
 def api_key(name: str) -> str:
@@ -47,22 +61,19 @@ class Upstream:
             def do_POST(self):
                 body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 header = upstream.owner(self.headers.get("Authorization", ""))
+                owner = upstream.owner(readable(body, self.headers))
                 with upstream.lock:
                     upstream.requests.append(
-                        {
-                            "path": self.path,
-                            "header": header,
-                            "body": upstream.owner(body.decode(errors="replace")),
-                            "raw": body,
-                        }
+                        {"path": self.path, "header": header, "body": owner, "raw": body}
                     )
                 if self.path != INFERENCE:
                     status = b"" if upstream.empty_status else f"status {header}".encode()
                     return self.send(200, "application/proto", status)
-                if header in upstream.exhausted:
+                # Like the real server, bill the key inside the request when it carries one.
+                if (owner or header) in upstream.exhausted:
                     payload = frame(2, json.dumps(QUOTA).encode())
                 else:
-                    payload = upstream.first_frame or reply(header)
+                    payload = upstream.first_frame or reply(owner or header)
                 self.send(200, "application/connect+proto", payload, chunked=True)
 
             def send(self, status, content_type, payload, *, chunked=False):

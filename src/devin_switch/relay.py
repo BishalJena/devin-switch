@@ -16,15 +16,21 @@ import re
 import ssl
 import sys
 import threading
+import time
 import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler
+from pathlib import Path
 from urllib.parse import urlsplit
 
+from devin_switch import otel
 from devin_switch.store import Account, Store
 
 ROTATION_LIMIT = 3
+EXHAUSTED_MEMORY = 600
+LOG_LIMIT = 1_000_000
 UPSTREAM_TIMEOUT = 300
 CHUNK = 64 * 1024
 END_STREAM = 0x02
@@ -98,6 +104,67 @@ def quota_frame(head: bytes, encoding: str | None) -> bool:
     return isinstance(message, str) and QUOTA_MESSAGE.search(message) is not None
 
 
+def messages(body: bytes, headers) -> list[bytes] | None:
+    """The request's decompressed message bytes, or None when it is not gzip-compressed."""
+    if (headers.get("Content-Encoding") or "").lower() == "gzip":
+        return [gzip.decompress(body)]
+    streaming = (headers.get("Content-Type") or "").startswith("application/connect")
+    if not streaming or (headers.get("Connect-Content-Encoding") or "").lower() != "gzip":
+        return None
+    result, index = [], 0
+    while index < len(body):
+        if index + 5 > len(body):
+            raise ValueError("Truncated Connect envelope")
+        flags, size = body[index], int.from_bytes(body[index + 1 : index + 5], "big")
+        payload = body[index + 5 : index + 5 + size]
+        if len(payload) != size:
+            raise ValueError("Truncated Connect message")
+        result.append(gzip.decompress(payload) if flags & COMPRESSED else payload)
+        index += 5 + size
+    return result
+
+
+def swap_key(body: bytes, headers, old: bytes, new: bytes) -> bytes:
+    """Replace the issued key in a request body, including inside gzip-compressed messages.
+
+    The native gzips large Connect streams (its chat requests); a key inside them is invisible
+    to a plain byte replacement, and the server then bills the issued login whatever the
+    header says. Keys have the same length, so protobuf lengths stay valid; only the
+    compressed envelopes are rebuilt. Anything unparseable falls back to a plain replacement.
+    """
+    if old == new:
+        return body
+    try:
+        if (headers.get("Content-Encoding") or "").lower() == "gzip":
+            return gzip.compress(gzip.decompress(body).replace(old, new))
+        if messages(body, headers) is not None:
+            frames, index = [], 0
+            while index < len(body):
+                flags, size = body[index], int.from_bytes(body[index + 1 : index + 5], "big")
+                payload = body[index + 5 : index + 5 + size]
+                if flags & COMPRESSED:
+                    payload = gzip.compress(gzip.decompress(payload).replace(old, new))
+                else:
+                    payload = payload.replace(old, new)
+                frames.append(bytes([flags]) + len(payload).to_bytes(4, "big") + payload)
+                index += 5 + size
+            return b"".join(frames)
+    except (OSError, EOFError, ValueError):
+        pass
+    return body.replace(old, new)
+
+
+def carries_key(body: bytes, headers, key: bytes) -> bool:
+    """Whether the issued key is in the body, looking inside gzip-compressed messages."""
+    if key in body:
+        return True
+    try:
+        decoded = messages(body, headers)
+    except (OSError, EOFError, ValueError):
+        return False
+    return decoded is not None and any(key in message for message in decoded)
+
+
 def first_frame(response: http.client.HTTPResponse) -> bytes:
     """Read just enough of a Connect stream to classify its first frame."""
     head = b""
@@ -111,17 +178,68 @@ def first_frame(response: http.client.HTTPResponse) -> bytes:
 
 
 class Relay:
-    def __init__(self, issued: Login, rotate: Callable[[Login, frozenset[str]], Login | None]):
+    def __init__(
+        self,
+        issued: Login,
+        rotate: Callable[[Login, frozenset[str]], Login | None],
+        log: Path | None = None,
+    ):
         self.issued = issued
         self.active = issued
         self.rotate = rotate
+        self.log = log
         self.lock = threading.Lock()
+        self.log_lock = threading.Lock()
+        self.exhausted: dict[str, float] = {}
         self.server = Server(self)
         threading.Thread(target=self.server.serve_forever, name="ds-relay", daemon=True).start()
 
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def record(self, event: str) -> None:
+        """Append a key-free line to the relay log: endpoint names, statuses and aliases only."""
+        if self.log is None:
+            return
+        line = f"{datetime.now().isoformat(timespec='milliseconds')} {event}\n"
+        with self.log_lock:
+            try:
+                self.log.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if self.log.exists() and self.log.stat().st_size > LOG_LIMIT:
+                    self.log.replace(self.log.with_suffix(".log.1"))
+                with open(self.log, "a") as handle:
+                    handle.write(line)
+            except OSError:
+                pass
+
+    def mark_exhausted(self, name: str) -> None:
+        with self.lock:
+            self.exhausted[name] = time.monotonic()
+
+    def recently_exhausted(self) -> frozenset[str]:
+        now = time.monotonic()
+        return frozenset(
+            name for name, seen in self.exhausted.items() if now - seen < EXHAUSTED_MEMORY
+        )
+
+    def recover(self, tried: frozenset[str]) -> Login | None:
+        """After a quota error reached the native: a login to continue on in the same process.
+
+        Keeps the active login when the relay already moved past every exhausted one, and
+        otherwise rotates to the next login with credits.
+        """
+        with self.lock:
+            tried = tried | self.recently_exhausted()
+            if self.active.account.name not in tried:
+                return self.active
+            replacement = self.rotate(self.active, tried)
+            if replacement is None or not compatible(self.issued, replacement):
+                self.record(f"recover failed tried={','.join(sorted(tried))}")
+                return None
+            self.record(f"recover {self.active.account.name} -> {replacement.account.name}")
+            self.active = replacement
+            return replacement
 
     def advance(self, tried: frozenset[str]) -> Login | None:
         """The login to replay with after every login in `tried` reported exhausted usage."""
@@ -130,10 +248,17 @@ class Relay:
             if current.account.name not in tried:
                 return current
             if len(tried) > ROTATION_LIMIT:
+                self.record(f"rotation limit reached tried={','.join(sorted(tried))}")
                 return None
+            started = time.monotonic()
             replacement = self.rotate(current, tried)
             if replacement is None or not compatible(self.issued, replacement):
+                self.record(f"rotate from {current.account.name} failed")
                 return None
+            self.record(
+                f"rotate {current.account.name} -> {replacement.account.name} "
+                f"in {time.monotonic() - started:.1f}s"
+            )
             self.active = replacement
             return replacement
 
@@ -142,7 +267,12 @@ class Relay:
         self.server.server_close()
 
 
-class Server(ThreadingHTTPServer):
+def endpoint(path: str) -> str:
+    """The RPC method name of a request path, without query strings."""
+    return path.split("?", 1)[0].rsplit("/", 1)[-1][:80]
+
+
+class Server(otel.LoopbackServer):
     daemon_threads = True
 
     def __init__(self, relay: Relay):
@@ -168,9 +298,8 @@ class Handler(BaseHTTPRequestHandler):
         if body is None:
             return self.refuse(400)
         # Only the native knows the issued key; some calls (analytics) carry it only in the body.
-        if (
-            relay.issued.key not in self.headers.get("Authorization", "")
-            and relay.issued.key.encode() not in body
+        if relay.issued.key not in self.headers.get("Authorization", "") and not carries_key(
+            body, self.headers, relay.issued.key.encode()
         ):
             return self.refuse(403)
         tried = set()
@@ -184,11 +313,16 @@ class Handler(BaseHTTPRequestHandler):
             streaming = (response.getheader("Content-Type") or "").startswith("application/connect")
             head = first_frame(response) if streaming else b""
             if head and quota_frame(head, response.getheader("Connect-Content-Encoding")):
+                relay.mark_exhausted(login.account.name)
+                relay.record(f"quota {login.account.name} {endpoint(self.path)}")
                 replacement = relay.advance(frozenset(tried))
                 if replacement is not None:
                     connection.close()
                     login = replacement
                     continue
+                relay.record(f"quota passed to the agent {endpoint(self.path)}")
+            elif response.status >= 400:
+                relay.record(f"status {response.status} {login.account.name} {endpoint(self.path)}")
             break
         try:
             self.pass_through(response, head)
@@ -235,7 +369,7 @@ class Handler(BaseHTTPRequestHandler):
             connection.request(
                 self.command,
                 parts.path + self.path,
-                body=body.replace(issued.key.encode(), login.key.encode()),
+                body=swap_key(body, self.headers, issued.key.encode(), login.key.encode()),
                 headers=headers,
             )
             return connection, connection.getresponse()

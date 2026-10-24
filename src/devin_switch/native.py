@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -31,6 +32,10 @@ AUTH_ENVIRONMENT = frozenset(
     }
 )
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+# `auth status` is a network round trip (about 1.6 s), paid on every GUI chat open. A
+# confirmed login is trusted for this long unless its credentials file changes.
+LOGIN_CHECK_TTL = 300
+verified_logins: dict[tuple, float] = {}
 TELEMETRY_VARIABLE = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"
 RECEIVER_ENDPOINT = re.compile(r"http://127\.0\.0\.1:\d+/[0-9a-f]{32}/v1/logs")
 
@@ -148,8 +153,15 @@ class Native:
         if not credentials.is_file() or credentials.stat().st_size == 0:
             return False
         credentials.chmod(0o600)
+        details = credentials.stat()
+        key = (str(credentials), details.st_ino, details.st_mtime_ns, details.st_size)
+        if verified_logins.get(key, 0) > time.monotonic():
+            return True
         output = ANSI_ESCAPE.sub("", self.capture(account, ("auth", "status")))
-        return bool(re.search(r"^Logged in(?:[ .]|$)", output, re.MULTILINE))
+        if not re.search(r"^Logged in(?:[ .]|$)", output, re.MULTILINE):
+            return False
+        verified_logins[key] = time.monotonic() + LOGIN_CHECK_TTL
+        return True
 
     def require_login(self, account: Account) -> None:
         if not self.authenticated(account):

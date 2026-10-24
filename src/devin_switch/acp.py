@@ -7,10 +7,9 @@ import sys
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 
-from devin_switch import acp_state, handoff, relay, sessions
+from devin_switch import acp_state, handoff, relay, sessions, subagents
 from devin_switch.native import Native
 from devin_switch.store import Account, SwitchError, write_json
 
@@ -19,6 +18,10 @@ LIFECYCLE_TIMEOUT = 30
 SHUTDOWN_TIMEOUT = 10
 IDLE_TIMEOUT = 15 * 60
 IDLE_RECHECK = 30
+HANDOVER_TIMEOUT = 10
+ORPHAN_TIMEOUT = 30
+LISTER_IDLE = 60
+SPARE_IDLE = 30 * 60
 LOCAL_COMMANDS = [
     {
         "name": "switch",
@@ -31,6 +34,10 @@ LOCAL_COMMANDS = [
         "input": {"hint": "optional account alias"},
     },
     {"name": "switch-status", "description": "Show this chat's saved account and exact session ID"},
+    {
+        "name": "resume-subagents",
+        "description": "Ask the agent to continue subagents that stopped before finishing",
+    },
     {
         "name": "auto-switch",
         "description": "Show or set switching automatically when usage runs out (all chats)",
@@ -58,6 +65,14 @@ BACKGROUND_UPDATES = {
     "session_info_update",
     "usage_update",
 }
+BUSY_ELSEWHERE = (
+    "This chat is busy in another Devin window. Let its turn finish or stop it there, "
+    "then open it here again."
+)
+STILL_CLOSING = (
+    "This chat's previous agent is still shutting down after Devin reloaded its agents "
+    "(it is never force-killed). Send your message again in a few seconds."
+)
 BLANK_RELEASED = (
     "This empty chat was closed after 15 idle minutes to free its agent. Nothing was sent "
     "to the model; start a new chat."
@@ -145,8 +160,11 @@ def registry(native: Native, account: str | None, sandbox: bool) -> dict:
 
 
 class Backend:
-    def __init__(self, bridge, account: Account, project: Path, session_id=None, *, chat=True):
+    def __init__(
+        self, bridge, account: Account, project: Path, session_id=None, *, chat=True, spare=False
+    ):
         self.bridge = bridge
+        self.spare = spare
         self.account = account
         self.project = project
         self.session_id = session_id
@@ -165,6 +183,9 @@ class Backend:
         self.mode = None
         self.model = None
         self.suppress_replay = False
+        # Subagent events count only once the conversation is loaded, not during its replay.
+        self.live = False
+        self.running = set()
         self.stopping = False
         self.stop_cause = None
         self.relay = None
@@ -180,7 +201,8 @@ class Backend:
                 self.account,
                 self.project,
                 self.session_id,
-                chat=self.chat,
+                # A warm spare is not a chat until it is attached to one.
+                chat=self.chat and not self.spare,
             )
         )
         try:
@@ -240,7 +262,9 @@ class Backend:
         """Route the native's API traffic through a relay that can change logins in place."""
         self.loop = asyncio.get_running_loop()
         self.relay = relay.Relay(
-            issued, lambda current, tried: self.bridge.rotate(self, issued, current, tried)
+            issued,
+            lambda current, tried: self.bridge.rotate(self, issued, current, tried),
+            self.bridge.native.store.root / "logs" / "relay.log",
         )
         try:
             await self.request(
@@ -422,6 +446,11 @@ class Bridge:
         self.tasks = set()
         self.queued = set()
         self.releasing = set()
+        self.opening = {}
+        self.lister = None
+        self.listing = asyncio.Lock()
+        self.spare = None
+        self.filling = False
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -482,6 +511,11 @@ class Bridge:
                     and item.get("name") not in BLOCKED_COMMANDS
                 ] + LOCAL_COMMANDS
                 backend.commands = update["availableCommands"]
+            meta = update.get("_meta")
+            if backend.live and backend.session_id and isinstance(meta, dict):
+                for key in (subagents.STARTED, subagents.COMPLETED):
+                    if isinstance(event := meta.get(key), dict):
+                        await self.track_subagent(backend, key, event)
             if backend.suppress_replay:
                 return
         if not backend.stopping:
@@ -539,10 +573,8 @@ class Bridge:
             self.initialization = copy.deepcopy(params)
             self.initialization["protocolVersion"] = 1
             probe = Backend(self, self.default_account(), Path.cwd(), chat=False)
-            try:
-                result = await probe.start()
-            finally:
-                await probe.close()
+            result = await probe.start()
+            self.lister = probe
             result["authMethods"] = []
             result["agentInfo"] = {
                 "name": "devin-switch",
@@ -555,6 +587,7 @@ class Bridge:
                 "close": {},
             }
             self.ready = True
+            self.spawn(self.refill())
             return result
         if not self.ready:
             raise RpcError("Initialize the GUI bridge first.", -32600)
@@ -654,10 +687,31 @@ class Bridge:
                 if error:
                     raise error
                 return result
+            if backend.relay:
+                tried |= backend.relay.recently_exhausted()
+            spent = ", ".join(sorted(tried)) or backend.account.name
+            if backend.relay and backend.process.poll() is None:
+                # Subagents live only in this process: continue in it on another login.
+                try:
+                    login = await asyncio.to_thread(backend.relay.recover, frozenset(tried))
+                except (SwitchError, OSError):
+                    login = None
+                if login is not None:
+                    backend.account = login.account
+                    tried.add(login.account.name)
+                    await self.note(
+                        chat.session_id,
+                        f"Out of usage on {spent}. Continuing on {login.account.name} in the "
+                        "same agent, so subagents keep running. "
+                        f"Sending “{handoff.CONTINUE_PROMPT}”…",
+                    )
+                    if chat.canceled:
+                        return {"stopReason": "cancelled"}
+                    params = await self.follow_up_params(chat)
+                    continue
             await self.note(
                 chat.session_id,
-                f"{backend.account.name} is out of usage. Auto-switch is on; "
-                "choosing another saved login…",
+                f"Out of usage on {spent}. Auto-switch is on; restarting on another saved login…",
             )
             try:
                 await self.switch(chat, None, exclude=frozenset(tried), follow_up=True)
@@ -673,7 +727,7 @@ class Bridge:
             if chat.canceled:
                 return {"stopReason": "cancelled"}
             tried.add(chat.backend.account.name)
-            params = continue_params(chat.session_id)
+            params = await self.follow_up_params(chat)
 
     async def forward_request(self, backend, method, params):
         result = await backend.request(method, params)
@@ -683,25 +737,160 @@ class Bridge:
         return result
 
     async def list_sessions(self, params):
-        history = await asyncio.to_thread(sessions.history, self.native.store)
-        items = []
-        for item in history:
-            if params.get("cwd") and item["project"] != params["cwd"]:
-                continue
-            timestamp = item["last_activity_at"]
-            if timestamp > 100_000_000_000:
-                timestamp /= 1000
-            items.append(
-                {
-                    "sessionId": item["id"],
-                    "cwd": item["project"],
-                    "title": item["title"] or "Untitled chat",
-                    "updatedAt": datetime.fromtimestamp(timestamp, UTC).isoformat(),
-                }
+        """Let the native list shared history: Desktop needs its filters, paging and _meta."""
+        async with self.listing:
+            lister = self.lister
+            if lister is None or lister.process.poll() is not None or lister.writer.is_closing():
+                self.lister = None
+                if lister:
+                    await lister.close()
+                lister = Backend(self, self.default_account(), Path.cwd(), chat=False)
+                await lister.start()
+                self.lister = lister
+        return await lister.request("session/list", params, LIFECYCLE_TIMEOUT)
+
+    async def close_lister(self):
+        async with self.listing:
+            lister = self.lister
+            if (
+                lister
+                and not lister.pending
+                and time.monotonic() - lister.last_activity >= LISTER_IDLE
+            ):
+                self.lister = None
+                await lister.close()
+
+    async def refill(self):
+        """Start a logged-in agent for the default login, so the next chat skips startup."""
+        if self.filling or self.spare is not None:
+            return
+        self.filling = True
+        try:
+            backend = Backend(self, self.default_account(), Path.home(), spare=True)
+            await backend.start()
+            self.spare = backend
+        except (SwitchError, OSError, RpcError):
+            pass
+        finally:
+            self.filling = False
+
+    async def drop_spare(self):
+        spare, self.spare = self.spare, None
+        if spare is not None:
+            await spare.close()
+
+    async def agent_for(self, account, project, session_id):
+        """A started native for a chat: the warm spare when it has the same login."""
+        if session_id:
+            await self.claim(session_id)
+        spare = self.spare
+        if spare is not None and (
+            spare.process.poll() is not None or spare.writer.is_closing() or spare.stopping
+        ):
+            await self.drop_spare()
+            spare = None
+        if spare is None or spare.account.name != account.name:
+            if spare is not None and spare.account.name != self.default_account().name:
+                await self.drop_spare()
+            self.spawn(self.refill())
+            backend = Backend(self, account, project, session_id)
+            await backend.start()
+            return backend
+        self.spare = None
+        self.spawn(self.refill())
+        try:
+            if session_id:
+                await asyncio.to_thread(spare.lease.attach, session_id, project, saved=True)
+            spare.spare = False
+            spare.project, spare.session_id = project, session_id
+            spare.last_activity = time.monotonic()
+        except BaseException:
+            await spare.close()
+            raise
+        return spare
+
+    async def track_subagent(self, backend, key, event):
+        agent = event.get("agentId")
+        if key == subagents.STARTED:
+            backend.running.add(agent)
+        else:
+            backend.running.discard(agent)
+        try:
+            await asyncio.to_thread(
+                subagents.record, self.native.store, backend.session_id, key, event
             )
-        return {"sessions": items}
+        except (SwitchError, OSError):
+            pass
+
+    async def go_live(self, backend):
+        """Start counting subagent events; ones an earlier process left running are now stopped."""
+        backend.live = True
+        try:
+            await asyncio.to_thread(
+                subagents.interrupt_running, self.native.store, backend.session_id
+            )
+        except (SwitchError, OSError):
+            pass
+
+    async def offer_resume(self, chat):
+        try:
+            pending = await asyncio.to_thread(
+                subagents.interrupted, self.native.store, chat.session_id
+            )
+        except (SwitchError, OSError):
+            return
+        if pending:
+            titles = ", ".join(info.get("title") or "untitled" for info in pending.values())
+            await self.note(
+                chat.session_id,
+                f"{len(pending)} subagent(s) stopped before finishing ({titles}). Their "
+                "transcripts are saved: send /resume-subagents to have the agent continue them "
+                "from where they stopped.",
+            )
+
+    async def follow_up_params(self, chat, *, resume_only=False):
+        """`continue`, plus a request to resume any subagents that stopped before finishing."""
+        store = self.native.store
+        params = continue_params(chat.session_id)
+        try:
+            pending = await asyncio.to_thread(subagents.interrupted, store, chat.session_id)
+            if not pending:
+                return None if resume_only else params
+            text = await asyncio.to_thread(subagents.resume_text, store, chat.session_id, pending)
+            await asyncio.to_thread(subagents.forget, store, chat.session_id, pending)
+        except (SwitchError, OSError):
+            return None if resume_only else params
+        block = params["prompt"][0]
+        block["text"] = text if resume_only else f"{block['text']}\n\n{text}"
+        return params
+
+    async def claim(self, session_id):
+        """Take a saved conversation over from another window's idle GUI connection."""
+        store = self.native.store
+        own = {backend.lease.run.id for backend in self.backends if backend.lease}
+        asked, holders, orphans = await asyncio.to_thread(
+            acp_state.request_handover, store, session_id, own
+        )
+        waiting = holders + orphans
+        # An orphan's stdin is already closed; it may still be finishing a tool call.
+        deadline = time.monotonic() + (ORPHAN_TIMEOUT if orphans else HANDOVER_TIMEOUT)
+        while waiting and await asyncio.to_thread(acp_state.held, store, session_id, waiting):
+            if time.monotonic() >= deadline:
+                await asyncio.to_thread(acp_state.cancel_handover, store, asked)
+                if await asyncio.to_thread(acp_state.held, store, session_id, holders):
+                    raise SwitchError(BUSY_ELSEWHERE)
+                raise SwitchError(STILL_CLOSING)
+            await asyncio.sleep(0.2)
 
     async def open_session(self, method, params):
+        if method == "session/new":
+            return await self.open_once(method, params)
+        # Desktop retries a slow load; let the retry reuse the first load's agent.
+        acp_state.session_key(params.get("sessionId"))
+        async with self.opening.setdefault(params["sessionId"], asyncio.Lock()):
+            return await self.open_once(method, params)
+
+    async def open_once(self, method, params):
         cwd = params.get("cwd")
         if not isinstance(cwd, str) or not Path(cwd).is_absolute() or not Path(cwd).is_dir():
             raise RpcError("Choose an existing absolute project directory.", -32602)
@@ -732,6 +921,7 @@ class Bridge:
                         self.chats.pop(session_id)
                     else:
                         chat.backend.suppress_replay = method == "session/resume"
+                        chat.backend.live = False
                         try:
                             result = await chat.backend.request(
                                 "session/load", setup, LIFECYCLE_TIMEOUT
@@ -740,6 +930,7 @@ class Bridge:
                             return result
                         finally:
                             chat.backend.suppress_replay = False
+                            chat.backend.live = True
         account = (
             self.default_account()
             if self.account
@@ -748,25 +939,30 @@ class Bridge:
                 or self.default_account()
             )
         )
-        backend = Backend(self, account, project, session_id)
-        backend.suppress_replay = method == "session/resume"
+        backend = None
         try:
-            await backend.start()
+            backend = await self.agent_for(account, project, session_id)
+            backend.suppress_replay = method == "session/resume"
             result = await backend.request(
                 "session/new" if session_id is None else "session/load", setup, LIFECYCLE_TIMEOUT
             )
             session_id = session_id or result.get("sessionId")
-            await asyncio.to_thread(backend.lease.attach, session_id)
+            await asyncio.to_thread(backend.lease.attach, session_id, project)
             backend.session_id = session_id
             setup["sessionId"] = session_id
             with self.native.store.lock(timeout=5):
                 acp_state.bind(self.native.store, session_id, account)
                 acp_state.set_lifecycle(self.native.store, backend.lease.run.id, "open")
             backend.suppress_replay = False
-            self.chats[session_id] = Chat(session_id, setup, backend, blank=method == "session/new")
+            chat = self.chats[session_id] = Chat(
+                session_id, setup, backend, blank=method == "session/new"
+            )
+            await self.go_live(backend)
+            self.spawn(self.offer_resume(chat))
             return result
         except BaseException:
-            await backend.close()
+            if backend is not None:
+                await backend.close()
             raise
 
     async def local_prompt(self, chat, params):
@@ -798,8 +994,8 @@ class Bridge:
         ):
             await self.note(
                 chat.session_id,
-                "Send /switch [ALIAS], /switch-continue [ALIAS], /switch-status, or "
-                "/auto-switch [on|off] alone, without attachments.",
+                "Send /switch [ALIAS], /switch-continue [ALIAS], /switch-status, "
+                "/resume-subagents, or /auto-switch [on|off] alone, without attachments.",
             )
             return done
         store = self.native.store
@@ -810,6 +1006,14 @@ class Bridge:
                 chat.session_id, await asyncio.to_thread(handoff.auto_switch_status, store)
             )
             return done
+        if command == "/resume-subagents":
+            await self.reconnect(chat)
+            params = await self.follow_up_params(chat, resume_only=True)
+            if params is None:
+                await self.note(chat.session_id, "No subagents of this chat are waiting to resume.")
+                return done
+            chat.blank = False
+            return await self.prompt_turn(chat, params)
         if command == "/switch-status":
             connected = chat.backend.process.poll() is None and not chat.backend.writer.is_closing()
             try:
@@ -846,10 +1050,11 @@ class Bridge:
             )
             return done
         if not follow_up:
+            await self.offer_resume(chat)
             return done
         if chat.canceled:
             return {"stopReason": "cancelled"}
-        return await self.prompt_turn(chat, continue_params(chat.session_id))
+        return await self.prompt_turn(chat, await self.follow_up_params(chat))
 
     async def publish_settings(self, chat):
         for update in (
@@ -901,6 +1106,7 @@ class Bridge:
         if setup is not None:
             chat.setup = setup
         await self.publish_settings(chat)
+        await self.offer_resume(chat)
         return result
 
     async def restore(self, chat, account, settings, mode, model, *, setup=None, replay=False):
@@ -927,11 +1133,11 @@ class Bridge:
 
     async def restore_once(self, chat, account, settings, mode, model, *, setup, replay):
         setup = chat.setup if setup is None else setup
-        candidate = Backend(self, account, Path(setup["cwd"]), chat.session_id)
-        candidate.suppress_replay = not replay
+        candidate = None
         stage = "starting the native agent"
         try:
-            await candidate.start()
+            candidate = await self.agent_for(account, Path(setup["cwd"]), chat.session_id)
+            candidate.suppress_replay = not replay
             stage = "loading the saved conversation"
             result = await candidate.request("session/load", setup, LIFECYCLE_TIMEOUT)
             stage = "restoring session settings"
@@ -1001,9 +1207,10 @@ class Bridge:
             if isinstance(result.get("models"), dict):
                 result["models"]["currentModelId"] = candidate.model
             candidate.suppress_replay = False
+            await self.go_live(candidate)
             return candidate, result
         except BaseException as exc:
-            closed = await candidate.close()
+            closed = await candidate.close() if candidate is not None else True
             if isinstance(exc, CatalogUnavailable) and closed:
                 raise CatalogUnavailable(f"{stage}: {exc}") from exc
             if isinstance(exc, (SwitchError, OSError)):
@@ -1012,6 +1219,7 @@ class Bridge:
 
     async def switch(self, chat, account_name, *, exclude=frozenset(), follow_up=False):
         old = chat.backend
+        source = old.account
         store = self.native.store
         if old.process.poll() is not None or old.writer.is_closing():
             raise SwitchError(
@@ -1026,9 +1234,10 @@ class Bridge:
         else:
             await self.note(chat.session_id, "Checking saved accounts for remaining usage…")
             account, _ = await asyncio.to_thread(
-                handoff.choose_best, self.native, old.account.name, exclude
+                handoff.choose_best, self.native, source.name, exclude
             )
-        if account.name == old.account.name:
+        # The relay may have moved this chat to another login meanwhile.
+        if account.name in (source.name, old.account.name):
             raise SwitchError("This GUI chat already uses that account.")
         await asyncio.to_thread(acp_state.check_login, self.native, account)
         await asyncio.to_thread(
@@ -1080,7 +1289,7 @@ class Bridge:
         await self.publish_settings(chat)
         await self.note(
             chat.session_id,
-            f"Switched {old.account.name} → {account.name}. Same conversation; "
+            f"Switched {source.name} → {account.name}. Same conversation; "
             "desktop login and other chats are unchanged. "
             + (
                 f"Sending “{handoff.CONTINUE_PROMPT}”…"
@@ -1157,6 +1366,7 @@ class Bridge:
                     or chat.controls is not None
                     or any(owner is backend for owner, _ in self.client_requests.values())
                     or chat.session_id in self.queued
+                    or backend.running
                 ):
                     return False
                 with store.lock(timeout=5):
@@ -1194,6 +1404,14 @@ class Bridge:
 
     async def poll(self):
         while True:
+            if (
+                self.lister
+                and not self.listing.locked()
+                and time.monotonic() - self.lister.last_activity >= LISTER_IDLE
+            ):
+                self.spawn(self.close_lister())
+            if self.spare and time.monotonic() - self.spare.last_activity >= SPARE_IDLE:
+                self.spawn(self.drop_spare())
             for chat in list(self.chats.values()):
                 if chat.suspended:
                     continue

@@ -5,7 +5,7 @@ import shlex
 import tempfile
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from devin_switch import sessions, usage
@@ -26,7 +26,7 @@ HOOK_COMMAND = (
 )
 HOOK = {"matcher": "", "hooks": [{"type": "command", "command": HOOK_COMMAND, "timeout": 5}]}
 CONTINUE_PROMPT = "continue"
-FULL_ALLOWANCE = 100
+CHECK_BATCH = 4
 # The CLI exports only when its user config names a destination. Each terminal launch overrides
 # this inert placeholder with a private receiver; other launches fail fast on the closed port.
 TELEMETRY = {
@@ -198,7 +198,9 @@ def choose_best(
     native: Native, current_account: str, exclude: frozenset[str] = frozenset()
 ) -> tuple[Account, float]:
     store = native.store
-    with store.lock():
+    # Wait briefly: other windows take this lock to open chats, and failing here makes
+    # the relay hand the quota error to the agent.
+    with store.lock(timeout=5):
         accounts = [
             account
             for account in store.accounts()
@@ -216,32 +218,28 @@ def choose_best(
         except SwitchError:
             return None
 
-    def candidates(stop_when_full: bool) -> tuple[list[tuple[Account, float]], bool]:
-        found = []
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(check, account) for account in accounts]
-            for future in as_completed(futures):
-                if (result := future.result()) is not None:
-                    found.append(result)
-                    if stop_when_full and result[1] >= FULL_ALLOWANCE:
-                        for pending in futures:
-                            pending.cancel()
-                        return found, True
-        return found, False
-
-    for stop_when_full in (True, False):
-        available, stopped = candidates(stop_when_full)
-        for account, remaining in sorted(
-            available, key=lambda result: (-result[1], result[0].name)
-        ):
-            try:
-                with store.account_lock(account, shared=True):
-                    if native.authenticated(account):
-                        return account, remaining
-            except SwitchError:
-                continue
-        if not stopped:
-            break
+    # Refreshing every login takes ~35 s with 126 of them, while the relay holds the
+    # request that ran out. Take the next login that confirms credits instead of the best
+    # one: saved readings (of any age) only decide the order, a few fresh checks at a time.
+    now = time.time()
+    hints = {
+        account.name: usage.cached_remaining(usage.read_cached(store, account, now=now), now=now)
+        for account in accounts
+    }
+    # Known-exhausted logins go after unknown ones, which may have reset or been unused.
+    accounts.sort(key=lambda account: (-(hints[account.name] or -2), account.name))
+    with ThreadPoolExecutor(max_workers=CHECK_BATCH) as executor:
+        for start in range(0, len(accounts), CHECK_BATCH):
+            for result in executor.map(check, accounts[start : start + CHECK_BATCH]):
+                if result is None:
+                    continue
+                account, remaining = result
+                try:
+                    with store.account_lock(account, shared=True):
+                        if native.authenticated(account):
+                            return account, remaining
+                except SwitchError:
+                    continue
     raise SwitchError(
         "No other saved login has confirmed remaining usage. This chat is unchanged. "
         "If usage is unavailable, choose an account explicitly: !ds switch ALIAS."

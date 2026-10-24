@@ -141,6 +141,40 @@ def test_gzip_compressed_quota_frame_is_detected(upstream, started):
     assert not relay.quota_frame(frame(2, weekly)[:-1], None)
 
 
+def test_keys_inside_gzip_compressed_requests_are_swapped(upstream, started):
+    """The native gzips its chat streams; the server bills the key inside them."""
+    upstream.exhausted = {"ansuman-1"}
+    proxy = started(make_login(upstream, "ansuman-1"), Rotations(upstream, ["ansuman-2"]))
+    message = b"\x0a\x30" + proxy.issued.key.encode() + b"\x12\x02hi"
+    body = frame(1, gzip.compress(message)) + frame(0, b"plain " + proxy.issued.key.encode())
+    status, data = post(
+        proxy,
+        key=api_key("ansuman-2"),  # the header alone must not let a request through
+        body=body,
+        headers={
+            "Content-Type": "application/connect+proto",
+            "Connect-Content-Encoding": "gzip",
+        },
+    )
+    assert status == 200 and b"reply from ansuman-2" in data
+    assert [owner for _, owner in upstream.inference()] == ["ansuman-1", "ansuman-2"]
+    raw = upstream.requests[-1]["raw"]
+    assert proxy.issued.key.encode() not in raw
+    assert gzip.decompress(raw[5 : 5 + int.from_bytes(raw[1:5], "big")]) == message.replace(
+        proxy.issued.key.encode(), api_key("ansuman-2").encode()
+    )
+    assert relay.carries_key(
+        body,
+        {"Content-Type": "application/connect+proto", "Connect-Content-Encoding": "gzip"},
+        proxy.issued.key.encode(),
+    )
+    assert not relay.carries_key(
+        frame(1, gzip.compress(b"nothing")),
+        {"Content-Type": "application/connect+proto", "Connect-Content-Encoding": "gzip"},
+        proxy.issued.key.encode(),
+    )
+
+
 def test_requests_without_the_issued_key_are_refused(upstream, started):
     proxy = started(make_login(upstream, "ansuman-1"), Rotations(upstream, ["ansuman-2"]))
 
