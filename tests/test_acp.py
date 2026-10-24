@@ -510,6 +510,64 @@ def test_gui_other_window_leaves_a_busy_chat_alone(acp_native, tmp_path, monkeyp
     asyncio.run(scenario())
 
 
+def orphan_native(store, session_id, project):
+    """A GUI run whose bridge has exited while its native still holds the run lock."""
+    import subprocess as sp
+    import uuid
+    from dataclasses import asdict
+
+    run = sessions.Run(uuid.uuid4().hex, "ansuman-1", str(project), "chat", 0.0, session_id)
+    (store.root / "runs").mkdir(exist_ok=True)
+    (store.root / "runs" / f"{run.id}.json").write_text(json.dumps(asdict(run)))
+    (store.root / f"acp-controller-{run.id}.lock").touch()
+    lock = store.root / f"run-{run.id}.lock"
+    native = sp.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl, sys, time; handle = open(sys.argv[1], 'a'); "
+            "fcntl.flock(handle, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(60)",
+            str(lock),
+        ],
+        stdout=sp.PIPE,
+    )
+    assert native.stdout.readline() == b"locked\n"
+    sessions.record_process(store, run.id, native.pid, role="native")
+    return run, native
+
+
+@pytest.mark.parametrize("exits", [True, False])
+def test_gui_reopen_waits_for_an_agent_orphaned_by_an_acp_reload(
+    acp_native, tmp_path, monkeypatch, exits
+):
+    store = acp_native.store
+    monkeypatch.setattr(acp, "ORPHAN_TIMEOUT", 3 if exits else 0.5)
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, _):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            await bridge.dispatch("session/close", {"sessionId": session_id})
+        run, native = orphan_native(store, session_id, tmp_path)
+        try:
+            assert acp_state.orphaned(store, run.id)
+            async with in_process(acp_native) as (bridge, _):
+                load = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+                if exits:
+                    asyncio.get_running_loop().call_later(0.5, native.kill)
+                    await bridge.dispatch("session/load", load)
+                    assert session_id in bridge.chats
+                else:
+                    with pytest.raises(SwitchError, match="still shutting down"):
+                        await bridge.dispatch("session/load", load)
+                    assert native.poll() is None  # never force-killed
+        finally:
+            native.kill()
+            native.wait()
+
+    asyncio.run(scenario())
+
+
 def test_gui_terminal_launch_of_the_same_chat_still_blocks_gui_load(acp_native, tmp_path):
     async def scenario():
         async with connect(acp_native) as first:

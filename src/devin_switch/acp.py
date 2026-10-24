@@ -19,6 +19,7 @@ SHUTDOWN_TIMEOUT = 10
 IDLE_TIMEOUT = 15 * 60
 IDLE_RECHECK = 30
 HANDOVER_TIMEOUT = 10
+ORPHAN_TIMEOUT = 30
 LISTER_IDLE = 60
 SPARE_IDLE = 30 * 60
 LOCAL_COMMANDS = [
@@ -67,6 +68,10 @@ BACKGROUND_UPDATES = {
 BUSY_ELSEWHERE = (
     "This chat is busy in another Devin window. Let its turn finish or stop it there, "
     "then open it here again."
+)
+STILL_CLOSING = (
+    "This chat's previous agent is still shutting down after Devin reloaded its agents "
+    "(it is never force-killed). Send your message again in a few seconds."
 )
 BLANK_RELEASED = (
     "This empty chat was closed after 15 idle minutes to free its agent. Nothing was sent "
@@ -863,12 +868,18 @@ class Bridge:
         """Take a saved conversation over from another window's idle GUI connection."""
         store = self.native.store
         own = {backend.lease.run.id for backend in self.backends if backend.lease}
-        asked, holders = await asyncio.to_thread(acp_state.request_handover, store, session_id, own)
-        deadline = time.monotonic() + HANDOVER_TIMEOUT
-        while holders and await asyncio.to_thread(acp_state.held, store, session_id, holders):
+        asked, holders, orphans = await asyncio.to_thread(
+            acp_state.request_handover, store, session_id, own
+        )
+        waiting = holders + orphans
+        # An orphan's stdin is already closed; it may still be finishing a tool call.
+        deadline = time.monotonic() + (ORPHAN_TIMEOUT if orphans else HANDOVER_TIMEOUT)
+        while waiting and await asyncio.to_thread(acp_state.held, store, session_id, waiting):
             if time.monotonic() >= deadline:
                 await asyncio.to_thread(acp_state.cancel_handover, store, asked)
-                raise SwitchError(BUSY_ELSEWHERE)
+                if await asyncio.to_thread(acp_state.held, store, session_id, holders):
+                    raise SwitchError(BUSY_ELSEWHERE)
+                raise SwitchError(STILL_CLOSING)
             await asyncio.sleep(0.2)
 
     async def open_session(self, method, params):

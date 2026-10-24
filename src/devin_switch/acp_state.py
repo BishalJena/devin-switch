@@ -122,14 +122,27 @@ def queue_close(store: Store, run_id: str) -> str:
     )
 
 
-def request_handover(store: Store, session_id: str, own: set[str]) -> tuple[list[str], list[str]]:
+def orphaned(store: Store, run_id: str) -> bool:
+    """A GUI run whose bridge has exited while its native is still shutting down.
+
+    Only GUI leases create the controller lock file, and only the bridge holds it; the native
+    keeps the run lock, so the run stays active until it exits on its own.
+    """
+    controller = f"acp-controller-{run_id}.lock"
+    return (store.root / controller).exists() and not store.locked(controller)
+
+
+def request_handover(
+    store: Store, session_id: str, own: set[str]
+) -> tuple[list[str], list[str], list[str]]:
     """Ask other windows' GUI connections holding this conversation to release it when idle.
 
-    Returns the runs newly asked to close and every live GUI run to wait for. Terminal
+    Returns the runs newly asked to close, every live GUI run to wait for, and the orphaned
+    natives (bridge gone, e.g. after an ACP reload) that are still shutting down. Terminal
     launches, older bridges without lifecycle sidecars and runs with a pending switch are
     left alone, so their usual duplicate-launch error still applies.
     """
-    asked, holders = [], []
+    asked, holders, orphans = [], [], []
     with store.lock(timeout=5):
         for run in sessions.runs(store):
             if (
@@ -143,13 +156,16 @@ def request_handover(store: Store, session_id: str, own: set[str]) -> tuple[list
                 state = lifecycle(store, run["id"])
             except SwitchError:
                 continue
+            if orphaned(store, run["id"]):
+                orphans.append(run["id"])
+                continue
             if state is None or request_path(store, run["id"]).exists():
                 continue
             if state == "open":
                 set_lifecycle(store, run["id"], "close_requested")
                 asked.append(run["id"])
             holders.append(run["id"])
-    return asked, holders
+    return asked, holders, orphans
 
 
 def held(store: Store, session_id: str, holders: list[str]) -> bool:
