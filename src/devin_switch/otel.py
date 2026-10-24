@@ -6,6 +6,7 @@ import struct
 import threading
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 
 MAX_BODY_BYTES = 4_000_000
 Attributes = dict[str, object]
@@ -117,6 +118,20 @@ def quota_exhausted(record: Attributes) -> bool:
     )
 
 
+class LoopbackServer(ThreadingHTTPServer):
+    """An HTTP server on 127.0.0.1 that skips HTTPServer's reverse DNS lookup.
+
+    `HTTPServer.server_bind` calls `socket.getfqdn`, which can stall for seconds where DNS is
+    slow (CI runners), delaying every terminal launch before the CLI starts.
+    """
+
+    daemon_threads = True
+
+    def server_bind(self) -> None:
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 class Receiver:
     """Accept log exports only at a random path, so other local processes cannot inject events."""
 
@@ -151,8 +166,7 @@ class Receiver:
             def log_message(self, *_args: object) -> None:
                 pass
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
+        self.server = LoopbackServer(("127.0.0.1", 0), Handler)
         self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}{path}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 

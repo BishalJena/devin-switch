@@ -21,10 +21,11 @@ import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from devin_switch import otel
 from devin_switch.store import Account, Store
 
 ROTATION_LIMIT = 3
@@ -271,7 +272,7 @@ def endpoint(path: str) -> str:
     return path.split("?", 1)[0].rsplit("/", 1)[-1][:80]
 
 
-class Server(ThreadingHTTPServer):
+class Server(otel.LoopbackServer):
     daemon_threads = True
 
     def __init__(self, relay: Relay):
