@@ -78,7 +78,11 @@ def subagent_update(session_id, key, value):
 
 
 async def subagent(session_id, agent_id):
-    subagent_update(session_id, "cognition.ai/subagent_started", {"agentId": agent_id})
+    subagent_update(
+        session_id,
+        "cognition.ai/subagent_started",
+        {"agentId": agent_id, "title": f"Title {agent_id}", "task": f"Task for {agent_id}"},
+    )
     gate = Path(os.environ["FAKE_SUBAGENT_GATE"])
     while not gate.exists():
         await asyncio.sleep(0.02)

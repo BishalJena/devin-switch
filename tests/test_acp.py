@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from fake_upstream import Upstream
 
-from devin_switch import acp, acp_state, cli, desktop, sessions, usage
+from devin_switch import acp, acp_state, cli, desktop, sessions, subagents, usage
 from devin_switch.native import Native
 from devin_switch.store import SwitchError
 
@@ -1972,6 +1972,115 @@ def test_gui_relay_keeps_subagents_running_when_usage_runs_out_mid_task(
     assert saved == {
         name: store.credentials(store.account(name)).read_text() for name in relayed.keys.values()
     }
+
+
+def save_subagent_transcript(store, session_id, agent):
+    """Write a subagent chain and head the way the native saves them in shared history."""
+    import sqlite3
+
+    with sqlite3.connect(store.root / "shared/cli/sessions.db") as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS subagent_heads (session_id TEXT, agent_id TEXT, "
+            "chain_node_id INTEGER, updated_at INTEGER, PRIMARY KEY (session_id, agent_id))"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS message_nodes (row_id INTEGER PRIMARY KEY, "
+            "session_id TEXT, node_id INTEGER, parent_node_id INTEGER, chat_message TEXT, "
+            "created_at INTEGER, metadata TEXT)"
+        )
+        steps = [
+            {"role": "system", "content": "You are a subagent"},
+            {"role": "user", "content": f"Task for {agent}"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"name": "exec", "arguments": {"command": "pytest -q"}}],
+            },
+            {"role": "tool", "content": f"{agent} ran the tests: 3 passed"},
+        ]
+        for node, step in enumerate(steps, 1):
+            connection.execute(
+                "INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    session_id,
+                    100 * len(agent) + node,
+                    (100 * len(agent) + node - 1) if node > 1 else None,
+                    json.dumps(step),
+                ),
+            )
+        connection.execute(
+            "INSERT OR REPLACE INTO subagent_heads VALUES (?, ?, ?, 0)",
+            (session_id, agent, 100 * len(agent) + len(steps)),
+        )
+
+
+def test_gui_subagents_stopped_by_a_crash_resume_from_their_saved_progress(
+    acp_native, relayed, tmp_path, monkeypatch
+):
+    store = acp_native.store
+    monkeypatch.setenv("FAKE_SUBAGENT_GATE", str(tmp_path / "never-opened"))
+
+    async def scenario():
+        async with in_process(acp_native) as (bridge, messages):
+            created = await bridge.dispatch("session/new", {"cwd": str(tmp_path), "mcpServers": []})
+            session_id = created["sessionId"]
+            chat = bridge.chats[session_id]
+            backend = chat.backend
+            turn = asyncio.create_task(
+                bridge.dispatch("session/prompt", prompt_params(session_id, "subagents"))
+            )
+            await until(lambda: backend.running == {"s1", "s2"})
+            assert set(subagents.load(store, session_id)["running"]) == {"s1", "s2"}
+            # Idle release never stops a chat whose subagents are still working.
+            turn_gate, chat.gate = chat.gate, asyncio.Lock()
+            backend.last_activity -= acp.IDLE_TIMEOUT + 1
+            assert not await bridge.release_idle(chat)
+            chat.gate = turn_gate
+            save_subagent_transcript(store, session_id, "s1")
+            backend.process.kill()
+            with pytest.raises(SwitchError):
+                await turn
+            await bridge.dispatch("session/load", chat.setup)
+            await until(lambda: "/resume-subagents" in json.dumps(messages))
+            assert "2 subagent(s) stopped before finishing (Title s1, Title s2)" in json.dumps(
+                messages
+            )
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "/resume-subagents"))
+            sent = [text for _, text in prompts(acp_native)][-1]
+            assert "2 of your subagents stopped before finishing" in sent
+            assert "Task for s1" in sent and "Task for s2" in sent
+            assert "s1 ran the tests: 3 passed" in sent and "pytest -q" in sent
+            assert "(none saved)" in sent  # s2 had no saved transcript
+            assert subagents.interrupted(store, session_id) == {}
+            await bridge.dispatch("session/prompt", prompt_params(session_id, "/resume-subagents"))
+            assert "No subagents of this chat are waiting to resume" in json.dumps(messages)
+
+    asyncio.run(scenario())
+
+
+def test_subagents_that_fail_on_quota_are_offered_for_resume(store):
+    session_id = "chat-quota"
+    subagents.record(store, session_id, subagents.STARTED, {"agentId": "a", "task": "Fix it"})
+    subagents.record(store, session_id, subagents.STARTED, {"agentId": "b", "task": "Test it"})
+    subagents.record(
+        store,
+        session_id,
+        subagents.COMPLETED,
+        {
+            "agentId": "a",
+            "success": False,
+            "summary": "[Error] daily usage quota has been exhausted",
+        },
+    )
+    subagents.record(
+        store, session_id, subagents.COMPLETED, {"agentId": "b", "success": True, "summary": "done"}
+    )
+    state = subagents.load(store, session_id)
+    assert state["running"] == {} and list(state["interrupted"]) == ["a"]
+    assert state["interrupted"]["a"]["reason"] == "usage ran out"
+    text = subagents.resume_text(store, session_id, state["interrupted"])
+    assert "Fix it" in text and "Test it" not in text
 
 
 @pytest.mark.parametrize("case", ["auto-switch-off", "no-login-left"])
