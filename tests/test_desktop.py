@@ -40,6 +40,25 @@ def test_snapshot_shows_accounts_while_cli_is_busy_without_exposing_tokens(
     assert "valid-" not in json.dumps(state)
 
 
+def test_snapshot_keeps_accounts_when_chrome_profiles_are_not_readable(
+    signed_in: Native, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    read_text = Path.read_text
+
+    def denied(path: Path, *args: object, **kwargs: object) -> str:
+        if path == tmp_path / "Local State":
+            raise PermissionError(1, "Operation not permitted")
+        return read_text(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    (tmp_path / "Local State").write_text("{}")
+    monkeypatch.setattr(browser, "CHROME_DATA", tmp_path)
+    monkeypatch.setattr(Path, "read_text", denied)
+    state = desktop.snapshot(signed_in.store)
+    assert [account["name"] for account in state["accounts"]] == ["ansuman-1", "ansuman-2"]
+    assert state["profiles"] == ()
+    assert "permission" in str(state["chrome_error"]).lower()
+
+
 def test_add_validates_chrome_profile_and_keeps_existing_account(
     store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:

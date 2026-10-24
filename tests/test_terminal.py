@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import pytest
+from otlp import encode_logs
 
 from devin_switch import desktop, handoff, sessions, terminal
 from devin_switch.native import Native
@@ -277,16 +278,21 @@ def test_automatic_request_sends_exit_keys_without_waiting_for_requester(store, 
 
 def test_quota_watch_matches_styled_split_alert_once_per_cooldown(monkeypatch):
     calls = []
-    monkeypatch.setattr(
-        handoff, "queue_automatic", lambda native, account: calls.append(account) or "switching"
-    )
+
+    def queue_automatic(native, account, progress):
+        progress("checking")
+        calls.append(account)
+        return "switching"
+
+    monkeypatch.setattr(handoff, "queue_automatic", queue_automatic)
     watch = terminal.QuotaWatch("native", "ansuman-1", cooldown=10)
     watch.feed(b"The agent mentioned quota limits\r\n\x1b]0;title\x07", 0)
     watch.feed(b"\x1b[1;3", 1)
     watch.feed(b"1mQuota\x1b[0m\x1b[2C\x1b[1mexhau", 1)
     watch.feed(b"sted\x1b[0m", 1)
     watch.worker.join(5)
-    assert calls == ["ansuman-1"] and watch.message() == "switching" and watch.message() == ""
+    assert calls == ["ansuman-1"]
+    assert [watch.message(), watch.message(), watch.message()] == ["checking", "switching", ""]
     watch.feed(b"Quota exhausted", 5)
     assert calls == ["ansuman-1"]
     watch.feed(b"Usage limit reached", 12)
@@ -294,8 +300,48 @@ def test_quota_watch_matches_styled_split_alert_once_per_cooldown(monkeypatch):
     assert calls == ["ansuman-1", "ansuman-1"]
 
 
+def test_quota_watch_matches_alert_followed_by_large_redraw_in_one_read(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        handoff, "queue_automatic", lambda native, account, progress: calls.append(account)
+    )
+    watch = terminal.QuotaWatch("native", "ansuman-1")
+    rule = "─".encode() * 180
+    watch.feed(
+        b"\x1b[33m \xe2\x96\xb2 Quota exhausted\x1b[0m\r\n   Your daily usage quota has been "
+        b"exhausted.\r\n\x1b[2m" + rule + b"\x1b[0m\r\n\xe2\x9d\xad \r\n" + rule,
+        0,
+    )
+    watch.worker.join(5)
+    assert calls == ["ansuman-1"]
+
+
+def test_typed_quota_error_bypasses_text_cooldown_once_per_incident(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        handoff, "queue_automatic", lambda native, account, progress: calls.append(account)
+    )
+    watch = terminal.QuotaWatch("native", "ansuman-1")
+    quota = {"event.name": "api_error", "error_kind": "ResourceExhausted"}
+    watch.feed(b"the agent printed: quota exhausted", 0)
+    watch.worker.join(5)
+    watch.record(quota)
+    watch.poll(1)
+    assert calls == ["ansuman-1"]
+    watch.record({**quota, "retry_after_ms": 1000})
+    watch.record({"event.name": "user_prompt"})
+    watch.poll(20)
+    assert calls == ["ansuman-1"]
+    watch.record(quota)
+    watch.record(quota)
+    watch.poll(20)
+    watch.worker.join(5)
+    watch.poll(21)
+    assert calls == ["ansuman-1", "ansuman-1"]
+
+
 def test_quota_watch_reports_check_failures_without_raising(monkeypatch):
-    def fail(native, account):
+    def fail(native, account, progress):
         raise OSError("sensitive-native-diagnostic")
 
     monkeypatch.setattr(handoff, "queue_automatic", fail)
@@ -306,10 +352,15 @@ def test_quota_watch_reports_check_failures_without_raising(monkeypatch):
     assert "unchanged" in message and "sensitive" not in message
 
 
-@pytest.mark.parametrize("exhausted", [True, False])
+@pytest.mark.parametrize(
+    ("exhausted", "trigger"), [(True, b"q"), (False, b"q"), (True, b"t"), (False, b"t")]
+)
 def test_quota_alert_automatically_resumes_and_continues_on_real_pty(
-    signed_in: Native, tmp_path: Path, monkeypatch, exhausted: bool
+    signed_in: Native, tmp_path: Path, monkeypatch, exhausted: bool, trigger: bytes
 ):
+    """`q` renders the alert text; `t` only exports the CLI's typed telemetry error."""
+    otlp = tmp_path / "quota.otlp"
+    otlp.write_bytes(encode_logs([{"event.name": "api_error", "error_kind": "ResourceExhausted"}]))
     monkeypatch.setattr(desktop.browser, "profiles", lambda: ())
     store = signed_in.store
     project = tmp_path / "project"
@@ -345,6 +396,12 @@ def test_quota_alert_automatically_resumes_and_continues_on_real_pty(
         "        sys.stdout.write('\\x1b[1;31mQuota\\x1b[0m\\x1b[1C'\n"
         "                         '\\x1b[1mexhausted\\x1b[0m\\r\\n')\n"
         "        sys.stdout.flush()\n"
+        "    if key == b't':\n"
+        "        import urllib.request\n"
+        "        urllib.request.urlopen(urllib.request.Request(\n"
+        "            os.environ['OTEL_EXPORTER_OTLP_LOGS_ENDPOINT'],\n"
+        "            data=pathlib.Path(os.environ['FAKE_OTLP']).read_bytes(),\n"
+        "            headers={'Content-Type': 'application/x-protobuf'}), timeout=5).read()\n"
         "config = pathlib.Path(os.environ['XDG_CONFIG_HOME']) / 'devin/config.json'\n"
         "event = {'hook_event_name':'SessionEnd','session_id':'exact-chat', "
         "'reason':'prompt_input_exit'}\n"
@@ -372,7 +429,7 @@ def test_quota_alert_automatically_resumes_and_continues_on_real_pty(
     master, slave = pty.openpty()
     process = subprocess.Popen(
         (sys.executable, str(driver), "run", "--account", "ansuman-1", "--", "--sandbox"),
-        env={**os.environ, "DS_BINARY": str(binary)},
+        env={**os.environ, "DS_BINARY": str(binary), "FAKE_OTLP": str(otlp)},
         cwd=project,
         stdin=slave,
         stdout=slave,
@@ -382,15 +439,16 @@ def test_quota_alert_automatically_resumes_and_continues_on_real_pty(
     )
     try:
         read_until(master, b"READY-ansuman-1")
-        os.write(master, b"q")
+        os.write(master, trigger)
+        notice = b"ds: Quota alert on ansuman-1. Checking usage"
         if exhausted:
             output = read_until(master, b"READY-ansuman-3")
-            assert b"ansuman-1 is out of usage" in output
+            assert -1 < output.find(notice) < output.find(b"ansuman-1 is out of usage")
             assert b'"args": ["--sandbox", "--resume", "exact-chat", "--", "continue"]' in output
             assert store.selected().name == "ansuman-3"
         else:
-            read_until(master, b"exhausted")
-            time.sleep(1.5)
+            output = read_until(master, b"this chat is unchanged")
+            assert -1 < output.find(notice) < output.find(b"ansuman-1 still reports 30% remaining")
             assert not list((store.root / "handoffs").glob("*.request.json"))
         os.write(master, b"\x04")
         assert process.wait(timeout=10) == 0

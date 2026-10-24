@@ -32,6 +32,11 @@ def profiles() -> tuple[ChromeProfile, ...]:
         )
     except FileNotFoundError as exc:
         raise SwitchError("No local Google Chrome profiles found.") from exc
+    except PermissionError as exc:
+        raise SwitchError(
+            "macOS denied permission to read Chrome's profile list. Allow Devin Switch under "
+            "System Settings → Privacy & Security, then reopen the app."
+        ) from exc
     except (json.JSONDecodeError, KeyError, AttributeError, TypeError) as exc:
         raise SwitchError("Chrome's profile index could not be read.") from exc
 
