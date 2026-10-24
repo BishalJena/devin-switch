@@ -2,15 +2,16 @@ import asyncio
 import json
 import os
 import sys
-from contextlib import asynccontextmanager
+import threading
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 import pytest
 from fake_upstream import Upstream
 
-from devin_switch import acp, acp_state, cli, desktop, sessions, subagents, usage
+from devin_switch import acp, acp_state, cli, desktop, handoff, sessions, subagents, usage
 from devin_switch.native import Native
-from devin_switch.store import SwitchError
+from devin_switch.store import Store, SwitchError
 
 
 @pytest.fixture
@@ -26,6 +27,57 @@ def acp_native(signed_in: Native, tmp_path: Path, monkeypatch):
     monkeypatch.setenv("FAKE_ACP_LOG", str(tmp_path / "requests.jsonl"))
     monkeypatch.chdir(tmp_path)
     return native
+
+
+CHOOSERS: dict[int, int] = {}
+LOCK_HOLDERS: dict[int, int] = {}
+
+
+def choose_best_holds_store_lock() -> bool:
+    """Whether a thread running choose_best holds the global store lock right now."""
+    return any(LOCK_HOLDERS.get(thread) for thread in CHOOSERS)
+
+
+@pytest.fixture(autouse=True)
+def track_store_lock_holders(monkeypatch):
+    """Record which threads hold the store lock and which run choose_best.
+
+    Usage refreshes must not run under the store lock taken by choose_best. Other launches
+    (a warm spare, another window) legitimately take it meanwhile, so tests check the
+    choosing thread, not whether anyone holds the lock.
+    """
+    original_lock, original_choose = Store.lock, handoff.choose_best
+
+    def count(table, thread, step):
+        table[thread] = table.get(thread, 0) + step
+
+    @contextmanager
+    def lock(self, filename="lock", **options):
+        with original_lock(self, filename, **options) as handle:
+            thread = threading.get_ident()
+            if filename == "lock":
+                count(LOCK_HOLDERS, thread, 1)
+            try:
+                yield handle
+            finally:
+                if filename == "lock":
+                    count(LOCK_HOLDERS, thread, -1)
+
+    def choose_best(*arguments, **options):
+        thread = threading.get_ident()
+        count(CHOOSERS, thread, 1)
+        try:
+            return original_choose(*arguments, **options)
+        finally:
+            count(CHOOSERS, thread, -1)
+            if not CHOOSERS[thread]:
+                del CHOOSERS[thread]
+
+    monkeypatch.setattr(Store, "lock", lock)
+    monkeypatch.setattr(handoff, "choose_best", choose_best)
+    yield
+    CHOOSERS.clear()
+    LOCK_HOLDERS.clear()
 
 
 class Client:
@@ -816,12 +868,7 @@ def test_gui_auto_switch_uses_fresh_quotas_and_bound_account(
     checked = []
 
     def refresh(store, account, *, force):
-        # Other launches (a warm spare, another window) may hold the store lock briefly, and
-        # slow CI runners stretch that; a caller holding it here would never let it go.
-        deadline = time.monotonic() + 10
-        while store.locked("lock") and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert force and not store.locked("lock")
+        assert force and not choose_best_holds_store_lock()
         checked.append(account.name)
         now = time.time()
         return usage.Usage(
@@ -1649,12 +1696,7 @@ def fresh_usage(exhausted=()):
     import time
 
     def refresh(store, account, *, force):
-        # Other launches (a warm spare, another window) may hold the store lock briefly, and
-        # slow CI runners stretch that; a caller holding it here would never let it go.
-        deadline = time.monotonic() + 10
-        while store.locked("lock") and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert force and not store.locked("lock")
+        assert force and not choose_best_holds_store_lock()
         now = time.time()
         used = 100 if account.name in exhausted else 20
         return usage.Usage(
