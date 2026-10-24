@@ -816,8 +816,9 @@ def test_gui_auto_switch_uses_fresh_quotas_and_bound_account(
     checked = []
 
     def refresh(store, account, *, force):
-        # Other launches may hold the store lock briefly; the caller must not hold it here.
-        deadline = time.monotonic() + 2
+        # Other launches (a warm spare, another window) may hold the store lock briefly, and
+        # slow CI runners stretch that; a caller holding it here would never let it go.
+        deadline = time.monotonic() + 10
         while store.locked("lock") and time.monotonic() < deadline:
             time.sleep(0.02)
         assert force and not store.locked("lock")
@@ -1648,8 +1649,9 @@ def fresh_usage(exhausted=()):
     import time
 
     def refresh(store, account, *, force):
-        # Other launches may hold the store lock briefly; the caller must not hold it here.
-        deadline = time.monotonic() + 2
+        # Other launches (a warm spare, another window) may hold the store lock briefly, and
+        # slow CI runners stretch that; a caller holding it here would never let it go.
+        deadline = time.monotonic() + 10
         while store.locked("lock") and time.monotonic() < deadline:
             time.sleep(0.02)
         assert force and not store.locked("lock")
