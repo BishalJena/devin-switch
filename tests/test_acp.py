@@ -935,6 +935,103 @@ def test_gui_reloading_current_tab_reuses_process_and_replays_history(acp_native
     asyncio.run(scenario())
 
 
+async def wait_for_text(client, text):
+    async with asyncio.timeout(10):
+        while text not in client.texts():
+            await asyncio.sleep(0.02)
+
+
+def replayed(messages, kind):
+    return [
+        message["params"]["update"]
+        for message in messages
+        if message.get("method") == "session/update"
+        and message["params"]["update"].get("sessionUpdate") == kind
+    ]
+
+
+def replayed_texts(messages, kind):
+    return [update["content"]["text"] for update in replayed(messages, kind)]
+
+
+def test_gui_reload_mid_turn_replays_without_interrupting_the_turn(acp_native, tmp_path):
+    """Switching Desktop surfaces reloads the open chat; a native load would end the turn."""
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            await client.request(
+                "session/set_config_option",
+                {"sessionId": session_id, "configId": "mode", "value": "plan"},
+            )
+            await client.prompt(session_id, "hello")
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+
+            start = len(client.messages)
+            loaded = await asyncio.wait_for(client.request("session/load", params), 5)
+            replay = client.messages[start:]
+            assert "sessionId" not in loaded["result"]
+            options = {
+                item["id"]: item["currentValue"] for item in loaded["result"]["configOptions"]
+            }
+            assert options == {"mode": "plan", "model": "test-model"}
+            assert replayed_texts(replay, "user_message_chunk") == ["hello", "busy"]
+            agent = replayed_texts(replay, "agent_message_chunk")
+            assert len(agent) == 2
+            assert json.loads(agent[0])["settings"]["mode"] == "plan"
+            assert agent[1] == "live progress"
+            (commands,) = replayed(replay, "available_commands_update")
+            assert "switch" in {item["name"] for item in commands["availableCommands"]}
+
+            start = len(client.messages)
+            resumed = await asyncio.wait_for(client.request("session/resume", params), 5)
+            assert "result" in resumed
+            assert not any(
+                message.get("method") == "session/update" for message in client.messages[start:]
+            )
+
+            assert not turn.done()
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            assert (await turn)["result"]["stopReason"] == "cancelled"
+            assert not any(call["method"] == "session/load" for call in logged(acp_native))
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reopen", ["reload", "switch"])
+def test_gui_reload_mid_turn_replays_from_the_latest_native_load(acp_native, tmp_path, reopen):
+    """The native's own replay replaces what came before, including one Desktop never saw."""
+
+    async def scenario():
+        async with connect(acp_native) as client:
+            session_id = await client.new(tmp_path)
+            await client.prompt(session_id, "hello")
+            params = {"sessionId": session_id, "cwd": str(tmp_path), "mcpServers": []}
+            if reopen == "reload":
+                assert "result" in await client.request("session/load", params)
+            else:
+                await client.prompt(session_id, "/switch ansuman-2")
+                assert acp_native.store.selected().name == "ansuman-2"
+            turn = asyncio.create_task(client.prompt(session_id, "busy"))
+            await wait_for_text(client, "live progress")
+
+            start = len(client.messages)
+            await asyncio.wait_for(client.request("session/load", params), 5)
+            replay = client.messages[start:]
+            assert replayed_texts(replay, "user_message_chunk") == ["busy"]
+            assert replayed_texts(replay, "agent_message_chunk") == [
+                "historical replay",
+                "live progress",
+            ]
+
+            await client.send({"method": "session/cancel", "params": {"sessionId": session_id}})
+            assert (await turn)["result"]["stopReason"] == "cancelled"
+
+    asyncio.run(scenario())
+
+
 def test_gui_switch_preserves_workspace_and_mcp_context_without_persisting_it(
     acp_native, tmp_path, monkeypatch
 ):

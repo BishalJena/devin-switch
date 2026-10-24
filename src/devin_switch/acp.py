@@ -955,6 +955,8 @@ class Bridge:
                 chat = self.chats[session_id]
                 if chat.setup["cwd"] != str(project):
                     raise SwitchError("Resume this conversation from its original project.")
+                if chat.controls is not None:
+                    return await self.replay(chat, method)
                 async with chat.access():
                     if self.chats.get(session_id) is not chat:
                         raise SwitchError(
@@ -1015,6 +1017,18 @@ class Bridge:
             if backend is not None:
                 await backend.close()
             raise
+
+    async def replay(self, chat, method):
+        """Reopen a chat whose turn is running (Desktop reloads it when switching surfaces).
+
+        A native session/load would end the turn, so replay what Desktop was already sent.
+        """
+        backend = chat.backend
+        async with backend.emitting:
+            if method == "session/load":
+                for text in [*backend.transcript, *backend.latest.values()]:
+                    await self.emit(json.loads(text))
+            return backend.reopened()
 
     async def local_prompt(self, chat, params):
         blocks = params.get("prompt", [])
