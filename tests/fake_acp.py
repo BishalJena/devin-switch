@@ -36,6 +36,8 @@ loaded = None
 project = None
 host = None
 canceled = asyncio.Event()
+# Running "busy" turns by request ID; like the native, a session/load ends them.
+turns = {}
 INFERENCE = "/exa.api_server_pb.ApiServerService/GetChatMessage"
 STATUS = "/exa.seat_management_pb.SeatManagementService/GetUserStatus"
 
@@ -194,6 +196,8 @@ async def handle(message):
             assert connection.execute(
                 "SELECT id FROM sessions WHERE id = ?", (session_id,)
             ).fetchone()
+            for ended in turns.values():
+                ended.set()
             update(
                 session_id,
                 {
@@ -295,6 +299,34 @@ async def handle(message):
             await asyncio.sleep(0.5)
         if text == "wait":
             await canceled.wait()
+        if text == "busy":
+            update(
+                loaded,
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "live progress"},
+                },
+            )
+            ended = turns[message["id"]] = asyncio.Event()
+            waits = [asyncio.create_task(event.wait()) for event in (canceled, ended)]
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+            for task in waits:
+                task.cancel()
+            turns.pop(message["id"])
+            if ended.is_set():
+                emit(
+                    {
+                        "id": message["id"],
+                        "error": {
+                            "code": -32603,
+                            "message": "Agent communication channel closed",
+                            "data": {"cognition.ai/errorKind": "agent_channel_closed"},
+                        },
+                    }
+                )
+                return
+            emit({"id": message["id"], "result": {"stopReason": "cancelled"}})
+            return
         if text == "crash":
             sys.stderr.write("sensitive-native-diagnostic\n")
             os._exit(7)

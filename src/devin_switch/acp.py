@@ -58,6 +58,7 @@ LIVE_CONTROLS = {
     "session/set_model",
     "_cognition.ai/command/revise",
 }
+OPENING = {"session/new", "session/load"}
 BACKGROUND_UPDATES = {
     "available_commands_update",
     "config_option_update",
@@ -186,6 +187,12 @@ class Backend:
         # Subagent events count only once the conversation is loaded, not during its replay.
         self.live = False
         self.running = set()
+        # What Desktop was sent since the latest session/new or session/load: replaying it answers
+        # a reload during a turn, which a native session/load would end. JSON text keeps it small.
+        self.opened = {}
+        self.transcript = []
+        self.latest = {}
+        self.emitting = asyncio.Lock()
         self.stopping = False
         self.stop_cause = None
         self.relay = None
@@ -298,6 +305,9 @@ class Backend:
         identifier = self.sequence
         future = asyncio.get_running_loop().create_future()
         self.pending[identifier] = future
+        if method in OPENING:
+            self.transcript.clear()
+            self.latest.clear()
         try:
             await self.send({"id": identifier, "method": method, "params": params})
             response = await asyncio.wait_for(future, timeout)
@@ -314,6 +324,8 @@ class Backend:
             if not isinstance(result, dict):
                 raise SwitchError("Native ACP returned an invalid response.")
             self.remember(result)
+            if method in OPENING:
+                self.opened = copy.deepcopy(result)
             return result
         except TimeoutError as exc:
             raise SwitchError(
@@ -342,6 +354,41 @@ class Backend:
             self.remember_selection("mode", result["modes"].get("currentModeId"))
         if isinstance(result.get("models"), dict):
             self.remember_selection("model", result["models"].get("currentModelId"))
+
+    def record(self, message):
+        update = message["params"]["update"]
+        text = json.dumps(message)
+        if update.get("sessionUpdate") in BACKGROUND_UPDATES:
+            self.latest[update["sessionUpdate"]] = text
+        else:
+            self.transcript.append(text)
+
+    def record_prompt(self, params):
+        """The native echoes prompts only when it replays a load, so keep them for a replay."""
+        for block in params.get("prompt", []):
+            self.transcript.append(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": params["sessionId"],
+                            "update": {"sessionUpdate": "user_message_chunk", "content": block},
+                        },
+                    }
+                )
+            )
+
+    def reopened(self):
+        """The load result with the settings as they are now."""
+        result = copy.deepcopy(self.opened)
+        result.pop("sessionId", None)
+        if "configOptions" in result:
+            result["configOptions"] = copy.deepcopy(list(self.configs.values()))
+        for category in ("mode", "model"):
+            if isinstance(listing := result.get(f"{category}s"), dict) and getattr(self, category):
+                listing[f"current{category.title()}Id"] = getattr(self, category)
+        return result
 
     async def read(self):
         try:
@@ -516,10 +563,13 @@ class Bridge:
                 for key in (subagents.STARTED, subagents.COMPLETED):
                     if isinstance(event := meta.get(key), dict):
                         await self.track_subagent(backend, key, event)
+            if backend.chat:
+                backend.record(message)
             if backend.suppress_replay:
                 return
         if not backend.stopping:
-            await self.emit(message)
+            async with backend.emitting:
+                await self.emit(message)
 
     async def handle(self, message):
         identifier = message.get("id") if isinstance(message, dict) else None
@@ -665,6 +715,7 @@ class Bridge:
             backend.stop_cause = None
             controls = chat.controls = set()
             result = error = None
+            backend.record_prompt(params)
             try:
                 result = await self.forward_request(backend, "session/prompt", params)
             except RpcError as exc:
@@ -904,6 +955,8 @@ class Bridge:
                 chat = self.chats[session_id]
                 if chat.setup["cwd"] != str(project):
                     raise SwitchError("Resume this conversation from its original project.")
+                if chat.controls is not None:
+                    return await self.replay(chat, method)
                 async with chat.access():
                     if self.chats.get(session_id) is not chat:
                         raise SwitchError(
@@ -964,6 +1017,18 @@ class Bridge:
             if backend is not None:
                 await backend.close()
             raise
+
+    async def replay(self, chat, method):
+        """Reopen a chat whose turn is running (Desktop reloads it when switching surfaces).
+
+        A native session/load would end the turn, so replay what Desktop was already sent.
+        """
+        backend = chat.backend
+        async with backend.emitting:
+            if method == "session/load":
+                for text in [*backend.transcript, *backend.latest.values()]:
+                    await self.emit(json.loads(text))
+            return backend.reopened()
 
     async def local_prompt(self, chat, params):
         blocks = params.get("prompt", [])
