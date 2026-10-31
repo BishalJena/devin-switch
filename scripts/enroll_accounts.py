@@ -38,7 +38,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CHROME_APP = "/Applications/Google Chrome.app"
-CHROME_DATA = Path.home() / "Library/Application Support/Google/Chrome"
+CHROME_DATA = Path(
+    os.environ.get("DS_CHROME_DATA") or Path.home() / "Library/Application Support/Google/Chrome"
+)
 LOGIN_URL = re.compile(r"https://app\.devin\.ai/auth/cli/continue\?\S*?cli_pkce_marker=1")
 ANY_LOGIN_URL = re.compile(r"https://\S*?cli_pkce_marker=1")
 ANSI = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]")
@@ -349,9 +351,19 @@ class Enroller:
             )
             await page.wait_for_timeout(2500)
         await page.get_by_label("Email address").fill(email)
+        if signup:
+            agreement = page.get_by_role("checkbox")
+            if await agreement.count():
+                await agreement.first.click()
+                await page.wait_for_timeout(500)
         await page.get_by_role("button", name="Sign up" if signup else "Log in", exact=True).click()
         await page.wait_for_timeout(4000)
         body = await page.inner_text("body")
+        if signup and "Please agree" in body:
+            await page.locator("input[type=checkbox]").check(force=True, timeout=5000)
+            await page.get_by_role("button", name="Sign up", exact=True).click()
+            await page.wait_for_timeout(4000)
+            body = await page.inner_text("body")
         if "Rate limit" in body:
             raise RateLimited("Devin rate limit")
         return "We've sent" in body

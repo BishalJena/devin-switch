@@ -284,3 +284,110 @@ def test_profile_check_sees_new_folders_when_blocked_and_waits_for_an_index(
     protect(tmp_path)
     assert enroll.has_profile("Plus 1") and not enroll.has_profile("Plus 2")
     assert chrome_helper.requests == []
+
+
+def test_chrome_data_follows_ds_chrome_data(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DS_CHROME_DATA", str(tmp_path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.CHROME_DATA == tmp_path
+
+
+class FakeAction:
+    def __init__(self, page: "FakeSignupPage", kind: str) -> None:
+        self.page, self.kind = page, kind
+
+    def or_(self, other: "FakeAction") -> "FakeAction":
+        return self
+
+    @property
+    def first(self) -> "FakeAction":
+        return self
+
+    async def count(self) -> int:
+        if self.kind == "checkbox":
+            return 2 if self.page.checkbox_present else 0
+        return 1
+
+    async def click(self) -> None:
+        if self.kind == "link":
+            self.page.signup_mode = True
+        elif self.kind == "checkbox":
+            if self.page.span_click_agrees:
+                self.page.agreed = True
+        elif self.kind == "button":
+            self.page.submits += 1
+
+    async def fill(self, value: str) -> None:
+        self.page.email = value
+
+    async def check(self, force: bool = False, timeout: int = 0) -> None:
+        self.page.agreed = True
+        self.page.force_checked = force
+
+
+class FakeSignupPage:
+    def __init__(self, checkbox_present: bool = True, span_click_agrees: bool = True) -> None:
+        self.url = "https://app.devin.ai/auth/login"
+        self.checkbox_present = checkbox_present
+        self.span_click_agrees = span_click_agrees
+        self.signup_mode = False
+        self.agreed = False
+        self.force_checked = False
+        self.submits = 0
+        self.email = ""
+
+    async def goto(self, url: str, **kwargs: object) -> None:
+        self.url = url
+
+    async def wait_for_timeout(self, ms: int) -> None:
+        return None
+
+    async def inner_text(self, selector: str) -> str:
+        if self.signup_mode and self.checkbox_present and not self.agreed:
+            return "Please agree before signing up."
+        return "Welcome We've sent you a code"
+
+    def get_by_label(self, label: str) -> FakeAction:
+        return FakeAction(self, "fill")
+
+    def get_by_role(self, role: str, name: str = "", exact: bool = False) -> FakeAction:
+        return FakeAction(self, role)
+
+    def locator(self, selector: str) -> FakeAction:
+        return FakeAction(self, "checkbox-input")
+
+
+def request_code(page: FakeSignupPage, signup: bool) -> bool:
+    enroller = enroll.Enroller(argparse.Namespace(plan="Teams"))
+    return asyncio.run(
+        enroller.request_code(page, "https://app.devin.ai/auth/login", "me+1@gmail.com", signup)
+    )
+
+
+def test_signup_agrees_to_terms_via_checkbox() -> None:
+    page = FakeSignupPage(span_click_agrees=True)
+    assert request_code(page, signup=True)
+    assert page.submits == 1
+    assert not page.force_checked
+
+
+def test_signup_force_checks_hidden_input_when_checkbox_click_is_ignored() -> None:
+    page = FakeSignupPage(span_click_agrees=False)
+    assert request_code(page, signup=True)
+    assert page.submits == 2
+    assert page.force_checked
+
+
+def test_signup_without_checkbox_still_submits() -> None:
+    page = FakeSignupPage(checkbox_present=False)
+    assert request_code(page, signup=True)
+    assert page.submits == 1
+
+
+def test_login_needs_no_agreement() -> None:
+    page = FakeSignupPage(span_click_agrees=False)
+    assert request_code(page, signup=False)
+    assert page.submits == 1
